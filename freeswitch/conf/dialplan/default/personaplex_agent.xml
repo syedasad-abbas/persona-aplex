@@ -1,0 +1,24 @@
+<include>
+  <!--
+    PersonaPlex Voice Agent Extension
+
+    Routes inbound calls to the PersonaPlex AI agent.
+    The v2-cpu bridge connects via ESL inbound and uses uuid_audio_stream
+    to pipe call audio to PersonaPlex's speech-to-speech model.
+
+    The call is answered and parked; the bridge detects CHANNEL_ANSWER
+    via ESL events and starts the audio stream automatically.
+
+    To route calls here, set destination_number to "persona_agent"
+    or adjust the regex below to match your DID/extension.
+  -->
+  <extension name="personaplex_agent">
+    <condition field="destination_number" expression="^persona_agent$">
+      <action application="answer"/>
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="playback_terminators=none"/>
+      <!-- Park the call — the ESL bridge will start uuid_audio_stream -->
+      <action application="park"/>
+    </condition>
+  </extension>
+</include>

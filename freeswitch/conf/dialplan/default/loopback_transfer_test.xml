@@ -1,0 +1,24 @@
+<!--
+  LOOPBACK TESTING
+
+  Uncomment this file content when you want to re-enable the dedicated
+  loopback transfer extensions used for local IVR transfer testing.
+
+<include>
+  <extension name="loopback_transfer_test_entry">
+    <condition field="destination_number" expression="^9398$">
+      <action application="answer"/>
+      <action application="echo"/>
+    </condition>
+  </extension>
+
+  <extension name="loopback_transfer_test_target">
+    <condition field="destination_number" expression="^9399$">
+      <action application="ring_ready"/>
+      <action application="sleep" data="3000"/>
+      <action application="answer"/>
+      <action application="echo"/>
+    </condition>
+  </extension>
+</include>
+-->

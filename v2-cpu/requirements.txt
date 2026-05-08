@@ -1,0 +1,6 @@
+# Bridge dependencies (PersonaPlex moshi is installed separately in Dockerfile)
+pymysql>=1.1.0
+python-dotenv>=1.0.0
+sphn>=0.1.4,<0.2
+numpy>=1.26,<2.2
+aiohttp>=3.10.5,<3.11

@@ -1,0 +1,12 @@
+<configuration name="event_socket.conf" description="Socket Client">
+  <settings>
+    <param name="nat-map" value="true"/>
+    <param name="listen-ip" value="0.0.0.0"/>
+    <param name="listen-port" value="8021"/>
+    <param name="password" value="FS!Secure2026"/>
+    <!-- allow_coders permits ESL from any IP (Docker networking / k8s pods) -->
+    <param name="apply-inbound-acl" value="allow_coders"/>
+    <!--<param name="apply-inbound-acl" value="loopback.auto"/>-->
+    <!--<param name="stop-on-bind-error" value="true"/>-->
+  </settings>
+</configuration>

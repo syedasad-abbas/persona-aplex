@@ -1,0 +1,14 @@
+<configuration name="http_cache.conf" description="HTTP GET cache">
+  <settings>
+    <!-- Keep http:// and https:// playback disabled while mod_httapi is loaded. -->
+    <param name="enable-file-formats" value="false"/>
+    <param name="max-urls" value="10000"/>
+    <param name="location" value="/var/lib/freeswitch/http_cache"/>
+    <param name="default-max-age" value="86400"/>
+    <param name="prefetch-thread-count" value="8"/>
+    <param name="prefetch-queue-size" value="100"/>
+    <param name="ssl-cacert" value="/etc/ssl/certs/ca-certificates.crt"/>
+    <param name="ssl-verifypeer" value="true"/>
+    <param name="ssl-verifyhost" value="true"/>
+  </settings>
+</configuration>

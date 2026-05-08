@@ -1,0 +1,7 @@
+<include>
+  <gateway name="531ebad1-e810-44f7-903c-be44f33e2f27">
+    <param name="from-domain" value="sipconvo.voslogic.com"/>
+    <param name="proxy" value="sipconvo.voslogic.com:5060"/>
+    <param name="register" value="false"/>
+  </gateway>
+</include>

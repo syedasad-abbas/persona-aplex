@@ -1,0 +1,23 @@
+<configuration name="avmd.conf" description="AVMD config">
+  <settings>
+    <!-- Keep status logging enabled for troubleshooting detection in SIP calls. -->
+    <param name="debug" value="0"/>
+    <param name="report_status" value="1"/>
+    <param name="fast_math" value="1"/>
+
+    <param name="require_continuous_streak" value="1"/>
+    <param name="sample_n_continuous_streak" value="3"/>
+    <param name="sample_n_to_skip" value="0"/>
+    <param name="require_continuous_streak_amp" value="1"/>
+    <param name="sample_n_continuous_streak_amp" value="3"/>
+    <param name="simplified_estimation" value="1"/>
+
+    <!-- Outbound attach improves AVMD start reliability on this trunk. -->
+    <param name="inbound_channel" value="0"/>
+    <param name="outbound_channel" value="1"/>
+
+    <param name="detection_mode" value="2"/>
+    <param name="detectors_n" value="36"/>
+    <param name="detectors_lagged_n" value="1"/>
+  </settings>
+</configuration>

@@ -1,0 +1,17 @@
+<include>
+  <extension name="avmd_loopback_beep_test">
+    <condition field="destination_number" expression="^9298$">
+      <action application="answer"/>
+      <action application="sleep" data="250"/>
+      <action application="avmd_start"/>
+      <action application="playback" data="tone_stream://%(1000,0,700)"/>
+      <action application="sleep" data="250"/>
+      <action application="playback" data="tone_stream://%(1020,0,700)"/>
+      <action application="sleep" data="250"/>
+      <action application="playback" data="tone_stream://%(980,0,700)"/>
+      <action application="sleep" data="800"/>
+      <action application="avmd_stop"/>
+      <action application="hangup"/>
+    </condition>
+  </extension>
+</include>

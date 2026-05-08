@@ -1,0 +1,8 @@
+<include>
+  <extension name="ivr_transfer_outbound">
+    <condition field="destination_number" expression="^77(\d+)$">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="bridge" data="${ivr_transfer_dialstring}"/>
+    </condition>
+  </extension>
+</include>

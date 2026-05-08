@@ -1,0 +1,80 @@
+FROM debian:bullseye
+MAINTAINER Andrey Volk <andrey@signalwire.com>
+
+# Install git and build dependencies
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -yq install git
+
+# Clone all required repositories
+RUN git clone https://github.com/signalwire/freeswitch /usr/src/freeswitch && \
+    git clone https://github.com/signalwire/libks /usr/src/libs/libks && \
+    git clone https://github.com/freeswitch/sofia-sip /usr/src/libs/sofia-sip && \
+    git clone https://github.com/freeswitch/spandsp /usr/src/libs/spandsp && \
+    git clone https://github.com/signalwire/signalwire-c /usr/src/libs/signalwire-c
+
+# Install build dependencies
+RUN DEBIAN_FRONTEND=noninteractive apt-get -yq install \
+    build-essential cmake automake autoconf libtool-bin pkg-config \
+    libssl-dev zlib1g-dev libdb-dev unixodbc-dev libncurses5-dev libexpat1-dev \
+    libgdbm-dev bison erlang-dev libtpl-dev libtiff5-dev uuid-dev \
+    libpcre2-dev libedit-dev libsqlite3-dev libcurl4-openssl-dev nasm \
+    libogg-dev libspeex-dev libspeexdsp-dev \
+    libldns-dev python3-dev \
+    libavformat-dev libswscale-dev libavresample-dev \
+    liblua5.2-dev libopus-dev libpq-dev \
+    libsndfile1-dev libflac-dev libvorbis-dev \
+    libshout3-dev libmpg123-dev libmp3lame-dev
+
+# Build and install dependencies
+RUN cd /usr/src/libs/libks && cmake . -DCMAKE_INSTALL_PREFIX=/usr -DWITH_LIBBACKTRACE=1 && make install && \
+    cd /usr/src/libs/sofia-sip && ./bootstrap.sh && ./configure CFLAGS="-g -ggdb" --with-pic --with-glib=no --without-doxygen --disable-stun --prefix=/usr && make -j$(nproc) && make install && \
+    cd /usr/src/libs/spandsp && ./bootstrap.sh && ./configure CFLAGS="-g -ggdb" --with-pic --prefix=/usr && make -j$(nproc) && make install && \
+    cd /usr/src/libs/signalwire-c && PKG_CONFIG_PATH=/usr/lib/pkgconfig cmake . -DCMAKE_INSTALL_PREFIX=/usr && make install
+
+# Enable mod_shout and mod_http_cache during build
+RUN sed -i 's|#formats/mod_shout|formats/mod_shout|' /usr/src/freeswitch/build/modules.conf.in && \
+    sed -i 's|#applications/mod_http_cache|applications/mod_http_cache|' /usr/src/freeswitch/build/modules.conf.in
+
+# Build and install FreeSWITCH
+RUN cd /usr/src/freeswitch && ./bootstrap.sh -j && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install
+
+# Install additional runtime dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates iproute2 libcurl4-openssl-dev libevent-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build and install mod_audio_stream (third-party module)
+RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /usr/src/mod_audio_stream && \
+    cd /usr/src/mod_audio_stream && \
+    git submodule update --init --recursive && \
+    mkdir -p build && cd build && \
+    PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc) && \
+    make install
+
+# Create necessary directories and symlinks (standard practice)
+RUN mkdir -p \
+    /usr/local/freeswitch/etc \
+    /usr/local/freeswitch/lib/freeswitch \
+    /usr/local/freeswitch/share/freeswitch \
+    /usr/local/freeswitch/var/lib/freeswitch \
+    /usr/local/freeswitch/var/log \
+    /usr/local/freeswitch/var/run \
+    /usr/local/freeswitch/var/cache && \
+    ln -sfn /usr/local/freeswitch/conf /usr/local/freeswitch/etc/freeswitch && \
+    ln -sfn /usr/local/freeswitch/mod /usr/local/freeswitch/lib/freeswitch/mod && \
+    ln -sfn /usr/local/freeswitch/log /usr/local/freeswitch/var/log/freeswitch && \
+    ln -sfn /usr/local/freeswitch/run /usr/local/freeswitch/var/run/freeswitch && \
+    ln -sfn /usr/local/freeswitch/db /usr/local/freeswitch/var/lib/freeswitch/db && \
+    ln -sfn /usr/local/freeswitch/recordings /usr/local/freeswitch/var/lib/freeswitch/recordings
+
+# Cleanup
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Optional: remove source to make image smaller (uncomment if you want)
+# RUN rm -rf /usr/src/*
+
+CMD ["/usr/local/freeswitch/bin/freeswitch", "-nonat"]
