@@ -1,0 +1,8 @@
+<include>
+  <extension name="personaplex_inbound_did">
+    <condition field="destination_number" expression="^(442037692810|00441277679024)$">
+      <action application="set" data="personaplex_agent_allowed=true"/>
+      <action application="transfer" data="persona_agent XML default"/>
+    </condition>
+  </extension>
+</include>

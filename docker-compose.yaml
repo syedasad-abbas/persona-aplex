@@ -1,0 +1,126 @@
+services:
+  freeswitch:
+    build: ./freeswitch
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5080:5080/udp"
+      - "5080:5080/tcp"
+      - "8021:8021"
+      - "4000-6000:4000-6000/udp"
+    restart: unless-stopped
+
+  # ── CPU variant (default) ──────────────────────────────────────────────────
+  personaplex:
+    build: ./v2-cpu
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - FS_ESL_HOST=freeswitch
+      - FS_ESL_PORT=8021
+      - FS_ESL_PASSWORD=FS!Secure2026
+      - DB_HOST=mysql
+      - DB_USER=api_user
+      - DB_PASS=${DB_PASS}
+      - DB_NAME=agent_db
+      - MOSHI_DEVICE=cpu
+      - VOICE_PROMPT=NATF2.pt
+      - AGENT_DOMAIN=appointment
+      - RELAY_HOST=personaplex
+      - FORK_MEDIA_MODE=mono
+      - FORK_RETRY_ON_NO_FRAMES=0
+      - INBOUND_GAIN=4.0
+      - OUTBOUND_GAIN=2.0
+      - FS_PLAYBACK_SAMPLE_RATE=8000
+      - MOSHI_HANDSHAKE_TIMEOUT=600
+      - MOSHI_PREWARM=1
+      - MOSHI_PREWARM_TIMEOUT=600
+      - MOSHI_SKIP_VOICE_PROMPT_STEPS=1
+      - MOSHI_SKIP_SYSTEM_PROMPTS=1
+      - MOSHI_AUDIO_SILENCE_FRAME_CNT=0
+      - RELAY_READY_TIMEOUT=120
+      - AUDIO_STATS_INTERVAL=5
+      - OUTBOUND_TEST_TONE=1
+      - OUTBOUND_TEST_TONE_DELAY=5.0
+      - OUTBOUND_TEST_TONE_DURATION_MS=2500
+      - OUTBOUND_TEST_TONE_CALLER=0000000000
+      - FS_PLAYBACK_BROADCAST_FALLBACK=1
+      - FS_PLAYBACK_BROADCAST_DELAY=0.25
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - model_cache:/app/cache
+    depends_on:
+      freeswitch:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── GPU variant ────────────────────────────────────────────────────────────
+  # Run with: docker compose --profile gpu up
+  #
+  # personaplex-gpu:
+  #   profiles: [gpu]
+  #   build: ./v2-gpu
+  #   environment:
+  #     - HF_TOKEN=${HF_TOKEN}
+  #     - FS_ESL_HOST=freeswitch
+  #     - FS_ESL_PORT=8021
+  #     - FS_ESL_PASSWORD=FS!Secure2026
+  #     - DB_HOST=mysql
+  #     - DB_USER=api_user
+  #     - DB_PASS=${DB_PASS}
+  #     - DB_NAME=agent_db
+  #     - MOSHI_DEVICE=cuda
+  #     - VOICE_PROMPT=NATF2.pt
+  #     - AGENT_DOMAIN=appointment
+  #     - RELAY_HOST=personaplex-gpu
+  #     - FORK_MEDIA_MODE=mono
+  #     - FORK_RETRY_ON_NO_FRAMES=0
+  #     - INBOUND_GAIN=4.0
+  #     - OUTBOUND_GAIN=2.0
+  #     - OUTBOUND_TEST_TONE=1
+  #   volumes:
+  #     - model_cache:/app/cache
+  #   depends_on:
+  #     freeswitch:
+  #       condition: service_started
+  #     mysql:
+  #       condition: service_healthy
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: agent_db
+      MYSQL_USER: api_user
+      MYSQL_PASSWORD: ${DB_PASS}
+    volumes:
+      - ./v2-cpu/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  mysql_data:
+  model_cache:

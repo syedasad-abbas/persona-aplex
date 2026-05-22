@@ -17,6 +17,8 @@ import subprocess
 import time
 import asyncio
 import threading
+import contextlib
+import json
 
 from dotenv import load_dotenv
 
@@ -112,12 +114,13 @@ def _esl_event_loop(domain_config):
     relay_ws_url = f"ws://{RELAY_HOST}:{RELAY_PORT}/audio"
     text_prompt = domain_config.TEXT_PROMPT
     voice_prompt = os.getenv("VOICE_PROMPT", domain_config.DEFAULT_VOICE_PROMPT)
+    stream_started = set()
 
     while True:
         try:
             esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
             esl.connect()
-            esl.subscribe("CHANNEL_CREATE CHANNEL_ANSWER CHANNEL_HANGUP CHANNEL_HANGUP_COMPLETE")
+            esl.subscribe("CHANNEL_CREATE CHANNEL_ANSWER CHANNEL_PARK CHANNEL_HANGUP CHANNEL_HANGUP_COMPLETE CUSTOM")
             log.info("ESL event loop running — watching for calls on FreeSWITCH %s:%d",
                      FS_ESL_HOST, FS_ESL_PORT)
 
@@ -126,18 +129,72 @@ def _esl_event_loop(domain_config):
                     name = event.event_name
                     uuid = event.get("Unique-ID", "")
 
-                    if name == "CHANNEL_ANSWER" and uuid:
-                        # Check if this call is destined for our agent
-                        dest = event.get("Caller-Destination-Number", "")
-                        direction = event.get("Call-Direction", "")
-                        context = event.get("Caller-Context", "")
+                    if name == "CUSTOM":
+                        subclass = event.get("Event-Subclass", "")
+                        if subclass.startswith("mod_audio_stream::"):
+                            log.info("FreeSWITCH %s uuid=%s body=%s", subclass, uuid or "unknown", event.body[:500])
 
-                        # Match calls routed to our agent extension
-                        if re.match(AGENT_DEST_PATTERN, dest):
+                            if subclass == "mod_audio_stream::play" and uuid:
+                                file_path = event.get("file", "") or event.get("File", "")
+                                payload = event.body or ""
+                                start = payload.find("{")
+                                end = payload.rfind("}")
+                                if not file_path and start != -1 and end != -1 and end > start:
+                                    try:
+                                        play_data = json.loads(payload[start:end + 1])
+                                        file_path = play_data.get("file", "")
+                                    except json.JSONDecodeError:
+                                        file_path = ""
+                                if file_path:
+                                        play_esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
+                                        try:
+                                            play_esl.connect()
+                                            play_result = play_esl.api("uuid_broadcast", f"{uuid} {file_path} aleg")
+                                            log.info("Call %s: uuid_broadcast %s → %s", uuid, file_path, play_result.strip()[:200])
+                                        finally:
+                                            play_esl.close()
+                        continue
+
+                    if name in ("CHANNEL_ANSWER", "CHANNEL_PARK") and uuid and uuid not in stream_started:
+                        dest_candidates = [
+                            event.get("Caller-Destination-Number", ""),
+                            event.get("variable_destination_number", ""),
+                            event.get("variable_dialed_extension", ""),
+                        ]
+                        marker = event.get("variable_personaplex_agent", "").lower()
+                        allowed = event.get("variable_personaplex_agent_allowed", "").lower()
+                        is_agent_call = marker == "true" and allowed == "true"
+
+                        if marker == "true" and not is_agent_call:
                             caller = event.get("Caller-Caller-ID-Number", "unknown")
-                            called = event.get("Caller-Destination-Number", "unknown")
-                            log.info("Call %s: Incoming %s → %s — starting PersonaPlex session",
-                                     uuid, caller, called)
+                            called = next((dest for dest in dest_candidates if dest), "persona_agent")
+                            log.warning(
+                                "Call %s: Ignoring unapproved agent event=%s caller=%s called=%s marker=%s allowed=%s context=%s state=%s",
+                                uuid,
+                                name,
+                                caller,
+                                called,
+                                marker,
+                                allowed or "missing",
+                                event.get("Caller-Context", ""),
+                                event.get("Channel-Call-State", ""),
+                            )
+
+                        if is_agent_call:
+                            stream_started.add(uuid)
+                            caller = event.get("Caller-Caller-ID-Number", "unknown")
+                            called = next((dest for dest in dest_candidates if dest), "persona_agent")
+                            log.info(
+                                "Call %s: Agent event=%s caller=%s called=%s marker=%s allowed=%s context=%s state=%s",
+                                uuid,
+                                name,
+                                caller,
+                                called,
+                                marker,
+                                allowed,
+                                event.get("Caller-Context", ""),
+                                event.get("Channel-Call-State", ""),
+                            )
 
                             # Register in DB
                             call_id = None
@@ -152,18 +209,39 @@ def _esl_event_loop(domain_config):
                             # Register session for the relay
                             register_session(uuid, caller, called, domain_config, call_id)
 
-                            # Start audio streaming via mod_audio_stream
-                            # uuid_audio_stream <uuid> start <ws-url> both 16000
+                            # Start audio streaming via mod_audio_stream.
+                            # uuid_audio_stream <uuid> start <ws-url> mono 16000
                             stream_url = f"{relay_ws_url}?uuid={uuid}"
-                            result = esl.api(
-                                "uuid_audio_stream",
-                                f"{uuid} start {stream_url} both {FS_SAMPLE_RATE}",
-                            )
-                            log.info("Call %s: uuid_audio_stream → %s", uuid, result.strip()[:200])
+                            stream_args = f"{uuid} start {stream_url} mono 16000"
+                            log.info("Call %s: Starting uuid_audio_stream args=%s", uuid, stream_args)
+                            cmd_esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
+                            try:
+                                cmd_esl.connect()
+                                for var, value in (
+                                    ("STREAM_MESSAGE_DEFLATE", "true"),
+                                    ("STREAM_SUPPRESS_LOG", "false"),
+                                ):
+                                    set_result = cmd_esl.api("uuid_setvar", f"{uuid} {var} {value}")
+                                    log.info("Call %s: uuid_setvar %s=%s -> %s", uuid, var, value, set_result.strip()[:120])
+                                result = cmd_esl.api("uuid_audio_stream", stream_args)
+                            finally:
+                                cmd_esl.close()
+                            result_text = result.strip()
+                            if result_text.startswith("-ERR"):
+                                log.error("Call %s: uuid_audio_stream failed: %s", uuid, result_text[:300])
+                            else:
+                                log.info("Call %s: uuid_audio_stream result: %s", uuid, result_text[:300])
 
                     elif name in ("CHANNEL_HANGUP", "CHANNEL_HANGUP_COMPLETE") and uuid:
+                        stream_started.discard(uuid)
                         unregister_session(uuid)
-                        log.info("Call %s: Hangup", uuid)
+                        log.info(
+                            "Call %s: Hangup event=%s cause=%s disposition=%s",
+                            uuid,
+                            name,
+                            event.get("Hangup-Cause", ""),
+                            event.get("variable_endpoint_disposition", ""),
+                        )
 
         except KeyboardInterrupt:
             break
@@ -197,15 +275,49 @@ def run_server():
     # 2. Start audio relay server (async)
     from bridge import start_relay_server
     relay_loop = asyncio.new_event_loop()
+    relay_runner = {"runner": None}
+    relay_ready = threading.Event()
+    relay_error = {"error": None}
+    relay_ready_timeout = int(os.getenv("RELAY_READY_TIMEOUT", "300"))
+
+    async def _cleanup_relay():
+        runner = relay_runner.get("runner")
+        if runner is not None:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+        tasks = [task for task in asyncio.all_tasks(relay_loop) if task is not asyncio.current_task(relay_loop)]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     def _run_relay():
         asyncio.set_event_loop(relay_loop)
-        relay_loop.run_until_complete(start_relay_server(domain_config))
-        relay_loop.run_forever()
+        try:
+            relay_runner["runner"] = relay_loop.run_until_complete(start_relay_server(domain_config))
+            relay_ready.set()
+            relay_loop.run_forever()
+        except Exception as e:
+            relay_error["error"] = e
+            relay_ready.set()
+            log.error("Audio relay startup failed: %s", e)
+        finally:
+            relay_loop.run_until_complete(_cleanup_relay())
+            relay_loop.run_until_complete(relay_loop.shutdown_asyncgens())
+            relay_loop.close()
 
     relay_thread = threading.Thread(target=_run_relay, daemon=True)
     relay_thread.start()
-    time.sleep(1)
+    if not relay_ready.wait(timeout=relay_ready_timeout):
+        log.error("Audio relay did not become ready within %ds", relay_ready_timeout)
+        with contextlib.suppress(Exception):
+            moshi_proc.terminate()
+        sys.exit(1)
+    if relay_error["error"] is not None:
+        with contextlib.suppress(Exception):
+            moshi_proc.terminate()
+        sys.exit(1)
 
     # 3. Watch for moshi process death
     def _watch_moshi():
@@ -218,8 +330,11 @@ def run_server():
 
     def shutdown(sig, _frame):
         log.info("Shutting down (signal %s)...", sig)
-        moshi_proc.terminate()
-        relay_loop.call_soon_threadsafe(relay_loop.stop)
+        with contextlib.suppress(Exception):
+            moshi_proc.terminate()
+        if relay_loop.is_running():
+            relay_loop.call_soon_threadsafe(relay_loop.stop)
+            relay_thread.join(timeout=5)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)

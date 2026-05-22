@@ -206,6 +206,12 @@ class ESLClient:
                 body = self.buf[:content_length].decode("utf-8", "replace")
                 self.buf = self.buf[content_length:]
 
+            if body and headers.get("Content-Type", "").startswith("text/event-plain"):
+                for line in body.splitlines():
+                    if ": " in line:
+                        k, v = line.split(": ", 1)
+                        headers[k.strip()] = v.strip()
+
             return ESLEvent(headers, body)
         finally:
             try:

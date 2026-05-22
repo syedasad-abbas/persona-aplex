@@ -1,5 +1,7 @@
 FROM vultik1/fs:0.1
 
+COPY conf/vars.xml /usr/local/freeswitch/vars.xml
+COPY conf/vars.xml /usr/local/freeswitch/conf/vars.xml
 
 
 COPY conf/autoload_configs/acl.conf.xml /usr/local/freeswitch/autoload_configs/acl.conf.xml
@@ -26,6 +28,8 @@ COPY conf/dialplan/default/avmd_loopback_test.xml /usr/local/freeswitch/dialplan
 COPY conf/dialplan/default/avmd_loopback_test.xml /usr/local/freeswitch/conf/dialplan/default/avmd_loopback_test.xml
 COPY conf/dialplan/default/personaplex_agent.xml /usr/local/freeswitch/dialplan/default/personaplex_agent.xml
 COPY conf/dialplan/default/personaplex_agent.xml /usr/local/freeswitch/conf/dialplan/default/personaplex_agent.xml
+COPY conf/dialplan/public/personaplex_inbound.xml /usr/local/freeswitch/dialplan/public/personaplex_inbound.xml
+COPY conf/dialplan/public/personaplex_inbound.xml /usr/local/freeswitch/conf/dialplan/public/personaplex_inbound.xml
 # LOOPBACK TESTING: uncomment these COPY lines to include the dedicated
 # loopback transfer dialplan when you want to run the local transfer test again.
 # COPY conf/dialplan/default/loopback_transfer_test.xml /usr/local/freeswitch/dialplan/default/loopback_transfer_test.xml
@@ -34,30 +38,26 @@ COPY conf/dialplan/default/personaplex_agent.xml /usr/local/freeswitch/conf/dial
 # Ensure required modules are configured to autoload.
 RUN set -eux; \
 	modules_file="/usr/local/freeswitch/conf/autoload_configs/modules.conf.xml"; \
-	for mod in mod_event_socket mod_sofia mod_commands mod_dptools mod_audio_fork mod_http_cache mod_avmd mod_vmd; do \
+	for mod in mod_event_socket mod_sofia mod_commands mod_dptools mod_audio_stream mod_http_cache mod_avmd mod_vmd; do \
 		if ! grep -q "<load module=\"${mod}\"/>" "${modules_file}"; then \
 			sed -i "/<\/modules>/i\    <load module=\"${mod}\"/>" "${modules_file}"; \
 		fi; \
 	done
 
-# Build and install mod_audio_fork (uuid_audio_fork API provider).
+# Install mod_audio_stream v1.0.3 package. The source build is receive-only;
+# v1.0.3 is required for streamAudio playback into the call.
 RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		git cmake build-essential pkg-config \
-		libwebsockets-dev libboost-all-dev libspeex-dev libspeexdsp-dev; \
-	rm -rf /var/lib/apt/lists/*; \
-	git clone --depth 1 https://github.com/W1ck3dZA/mod_audio_fork.git /usr/src/mod_audio_fork; \
-	cd /usr/src/mod_audio_fork; \
-	mkdir -p build; \
-	cd build; \
-	cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DFREESWITCH_INCLUDE_DIR=/usr/local/freeswitch/include/freeswitch \
-		-DFREESWITCH_LIBRARY=/usr/local/freeswitch/lib/libfreeswitch.so; \
-	make -j"$(nproc)"; \
-	cp mod_audio_fork.so /usr/local/freeswitch/mod/mod_audio_fork.so; \
-	test -f /usr/local/freeswitch/mod/mod_audio_fork.so
+		ca-certificates wget dpkg-dev iproute2 zlib1g libssl3 libevent-2.1-7 libevent-pthreads-2.1-7 libevent-openssl-2.1-7 libspeexdsp1; \
+	wget -O /tmp/mod-audio-stream.deb https://github.com/amigniter/mod_audio_stream/releases/download/v1.0.3/mod-audio-stream_1.0.3_amd64.deb; \
+	mkdir -p /tmp/mod-audio-stream; \
+	dpkg-deb -x /tmp/mod-audio-stream.deb /tmp/mod-audio-stream; \
+	so_path="$(find /tmp/mod-audio-stream -name mod_audio_stream.so -print -quit)"; \
+	test -n "${so_path}"; \
+	install -m 0755 "${so_path}" /usr/local/freeswitch/mod/mod_audio_stream.so; \
+	rm -rf /tmp/mod-audio-stream /tmp/mod-audio-stream.deb /var/lib/apt/lists/*; \
+	test -f /usr/local/freeswitch/mod/mod_audio_stream.so
 
 RUN mkdir -p /var/lib/freeswitch/http_cache
 VOLUME ["/var/lib/freeswitch/http_cache"]

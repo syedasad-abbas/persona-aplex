@@ -14,11 +14,14 @@
   -->
   <extension name="personaplex_agent">
     <condition field="destination_number" expression="^persona_agent$">
-      <action application="answer"/>
-      <action application="set" data="hangup_after_bridge=true"/>
-      <action application="set" data="playback_terminators=none"/>
-      <!-- Park the call — the ESL bridge will start uuid_audio_stream -->
-      <action application="park"/>
+      <condition field="${personaplex_agent_allowed}" expression="^true$">
+        <action application="set" data="personaplex_agent=true"/>
+        <action application="answer"/>
+        <action application="set" data="hangup_after_bridge=true"/>
+        <action application="set" data="playback_terminators=none"/>
+        <!-- Park the call — the ESL bridge will start uuid_audio_stream -->
+        <action application="park"/>
+      </condition>
     </condition>
   </extension>
 </include>
