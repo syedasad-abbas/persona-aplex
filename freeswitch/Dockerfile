@@ -44,19 +44,22 @@ RUN set -eux; \
 		fi; \
 	done
 
-# Install mod_audio_stream v1.0.3 package. The source build is receive-only;
-# v1.0.3 is required for streamAudio playback into the call.
+# Build mod_audio_stream against this Debian 11 FreeSWITCH image.  The
+# prebuilt upstream package is Debian 12 and requires newer glibc/OpenSSL.
 RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		ca-certificates wget dpkg-dev iproute2 zlib1g libssl3 libevent-2.1-7 libevent-pthreads-2.1-7 libevent-openssl-2.1-7 libspeexdsp1; \
-	wget -O /tmp/mod-audio-stream.deb https://github.com/amigniter/mod_audio_stream/releases/download/v1.0.3/mod-audio-stream_1.0.3_amd64.deb; \
-	mkdir -p /tmp/mod-audio-stream; \
-	dpkg-deb -x /tmp/mod-audio-stream.deb /tmp/mod-audio-stream; \
-	so_path="$(find /tmp/mod-audio-stream -name mod_audio_stream.so -print -quit)"; \
-	test -n "${so_path}"; \
-	install -m 0755 "${so_path}" /usr/local/freeswitch/mod/mod_audio_stream.so; \
-	rm -rf /tmp/mod-audio-stream /tmp/mod-audio-stream.deb /var/lib/apt/lists/*; \
+		ca-certificates git cmake build-essential pkg-config iproute2 \
+		zlib1g zlib1g-dev libssl1.1 libssl-dev libevent-dev libspeexdsp1 libspeexdsp-dev; \
+	git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /tmp/mod_audio_stream; \
+	cd /tmp/mod_audio_stream; \
+	git submodule update --init --recursive; \
+	mkdir build; \
+	cd build; \
+	PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig cmake -DCMAKE_BUILD_TYPE=Release ..; \
+	make -j"$(nproc)"; \
+	install -m 0755 mod_audio_stream.so /usr/local/freeswitch/mod/mod_audio_stream.so; \
+	rm -rf /tmp/mod_audio_stream /var/lib/apt/lists/*; \
 	test -f /usr/local/freeswitch/mod/mod_audio_stream.so
 
 RUN mkdir -p /var/lib/freeswitch/http_cache
@@ -70,5 +73,9 @@ ENV ESL_PASSWORD=FS!Secure2026
 EXPOSE 8021
 ENV PATH="/usr/local/freeswitch/bin:${PATH}"
 
-# Start FreeSWITCH automatically
+COPY scripts/freeswitch-entrypoint.sh /usr/local/bin/freeswitch-entrypoint.sh
+RUN chmod +x /usr/local/bin/freeswitch-entrypoint.sh
+
+# Start FreeSWITCH automatically after refreshing external SIP/RTP IPs.
+ENTRYPOINT ["/usr/local/bin/freeswitch-entrypoint.sh"]
 CMD ["/usr/local/freeswitch/bin/freeswitch", "-nonat"]

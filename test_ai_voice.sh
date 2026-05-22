@@ -39,7 +39,8 @@ echo
 echo "[0/8] Waiting for PersonaPlex voice agent..."
 READY=0
 for _ in $(seq 1 120); do
-  if docker compose logs --tail=5000 "$AI_SERVICE" 2>/dev/null | grep -Eq "Voice agent ready"; then
+  HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' persona-aplex-personaplex-1 2>/dev/null || true)
+  if [ "$HEALTH" = "healthy" ] || docker compose logs --tail=5000 "$AI_SERVICE" 2>/dev/null | grep -Eq "Voice agent ready"; then
     READY=1
     break
   fi

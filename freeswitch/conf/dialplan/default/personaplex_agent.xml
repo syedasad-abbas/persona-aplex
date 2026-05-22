@@ -17,6 +17,8 @@
       <condition field="${personaplex_agent_allowed}" expression="^true$">
         <action application="set" data="personaplex_agent=true"/>
         <action application="answer"/>
+        <action application="set" data="record_stereo=true"/>
+        <action application="record_session" data="/tmp/personaplex_agent_${uuid}.wav"/>
         <action application="set" data="hangup_after_bridge=true"/>
         <action application="set" data="playback_terminators=none"/>
         <!-- Park the call — the ESL bridge will start uuid_audio_stream -->
