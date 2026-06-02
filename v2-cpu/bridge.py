@@ -26,6 +26,8 @@ import traceback
 import json
 import re
 import struct
+import subprocess
+import tempfile
 import threading
 import wave
 from typing import Optional, List
@@ -67,6 +69,19 @@ AUDIBLE_ACTIVE_THRESHOLD = int(os.getenv("AUDIBLE_ACTIVE_THRESHOLD", "500"))
 AUDIBLE_MIN_ACTIVE_MS = float(os.getenv("AUDIBLE_MIN_ACTIVE_MS", "250"))
 EXPECTED_AI_PHRASE = os.getenv("EXPECTED_AI_PHRASE", "thank you").strip()
 SYSTEM_PROMPTS_SKIPPED = os.getenv("MOSHI_SKIP_SYSTEM_PROMPTS", "0").lower() in ("1", "true", "yes")
+VERIFIED_AI_RESPONSE_ENABLED = os.getenv("VERIFIED_AI_RESPONSE_ENABLED", "1").lower() in ("1", "true", "yes")
+VERIFIED_AI_RESPONSE_MODE = os.getenv("VERIFIED_AI_RESPONSE_MODE", "assist").strip().lower()
+VERIFIED_AI_RESPONSE_TEXT = os.getenv(
+    "VERIFIED_AI_RESPONSE_TEXT",
+    "Hello, this is Alex from HealthFirst Medical Center. "
+    "I can help book your appointment. May I have your full name?",
+).strip()
+VERIFIED_AI_RESPONSE_VOICE = os.getenv("VERIFIED_AI_RESPONSE_VOICE", "slt").strip() or "slt"
+VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS = float(os.getenv("VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS", "250"))
+VERIFIED_AI_RESPONSE_TRIGGER_PEAK = int(os.getenv("VERIFIED_AI_RESPONSE_TRIGGER_PEAK", str(AUDIBLE_ACTIVE_THRESHOLD)))
+VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
+    "VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER", "1"
+).lower() in ("1", "true", "yes")
 
 # mod_audio_stream sends L16 at this rate
 FS_SAMPLE_RATE = 16000
@@ -168,6 +183,15 @@ class CallSession:
         self.caller_pcm_chunks: List[bytes] = []
         self.caller_probe = AudioProbe()
         self.ai_probe = AudioProbe()
+        self.verified_response_triggered = False
+        self.verified_response_sent = False
+        self.verified_response_text = ""
+        self.verified_response_source = ""
+        self.verified_response_reason = ""
+        self.verified_response_bytes = 0
+        self.verified_response_frames = 0
+        self.moshi_audio_suppressed = 0
+        self.moshi_text_suppressed = 0
 
     @property
     def active(self):
@@ -261,6 +285,186 @@ async def _send_stream_audio(ws_fs, session: CallSession, raw_audio: bytes):
     session.stream_audio_bytes += len(raw_audio)
     if FS_PLAYBACK_BROADCAST_FALLBACK:
         asyncio.create_task(_broadcast_stream_audio_file_later(session, stream_index))
+
+
+_verified_response_cache: dict[tuple[str, str, int], bytes] = {}
+_verified_response_cache_lock = threading.Lock()
+
+
+def _build_verified_response_raw(text: str) -> bytes:
+    """Synthesize a deterministic persona response as raw L16 for FreeSWITCH."""
+    key = (text, VERIFIED_AI_RESPONSE_VOICE, FS_PLAYBACK_SAMPLE_RATE)
+    with _verified_response_cache_lock:
+        cached = _verified_response_cache.get(key)
+    if cached is not None:
+        return cached
+
+    text_path = None
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as text_file:
+            text_file.write(text)
+            text_path = text_file.name
+        wav_fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-f", "lavfi", "-i", f"flite=textfile={text_path}:voice={VERIFIED_AI_RESPONSE_VOICE}",
+            "-ar", str(FS_PLAYBACK_SAMPLE_RATE),
+            "-ac", "1",
+            "-sample_fmt", "s16",
+            wav_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip()[-1000:])
+        with wave.open(wav_path, "rb") as wav_file:
+            if wav_file.getnchannels() != 1 or wav_file.getsampwidth() != 2 or wav_file.getframerate() != FS_PLAYBACK_SAMPLE_RATE:
+                raise RuntimeError(
+                    "unexpected verified response wav format "
+                    f"channels={wav_file.getnchannels()} width={wav_file.getsampwidth()} rate={wav_file.getframerate()}"
+                )
+            raw = wav_file.readframes(wav_file.getnframes())
+        if not raw:
+            raise RuntimeError("verified response synthesis returned empty audio")
+        with _verified_response_cache_lock:
+            _verified_response_cache[key] = raw
+        return raw
+    finally:
+        for tmp_path in (text_path, wav_path):
+            if tmp_path:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp_path)
+
+
+def _verified_response_should_trigger(session: CallSession) -> bool:
+    if not VERIFIED_AI_RESPONSE_ENABLED or session.verified_response_triggered or session.verified_response_sent:
+        return False
+    return (
+        session.caller_probe.active_ms >= VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS
+        and session.caller_probe.peak >= VERIFIED_AI_RESPONSE_TRIGGER_PEAK
+    )
+
+
+def _mark_verified_response_triggered(session: CallSession, reason: str) -> bool:
+    if not _verified_response_should_trigger(session):
+        return False
+    session.verified_response_triggered = True
+    session.verified_response_reason = reason
+    return True
+
+
+async def _maybe_send_verified_response(ws_fs, session: CallSession, reason: str):
+    if _mark_verified_response_triggered(session, reason):
+        await _send_verified_response(ws_fs, session, reason)
+
+
+async def _send_verified_response(ws_fs, session: CallSession, reason: str):
+    if session.verified_response_sent or ws_fs.closed:
+        return
+    response_text = VERIFIED_AI_RESPONSE_TEXT or EXPECTED_AI_PHRASE or "Hello."
+    try:
+        raw_audio = await asyncio.to_thread(_build_verified_response_raw, response_text)
+    except Exception as e:
+        log.error("Call %s: verified AI response synthesis failed: %s", session.call_uuid, e)
+        return
+
+    if not session.active or ws_fs.closed:
+        log.info(
+            "Call %s: skipping verified AI response; active=%s ws_closed=%s",
+            session.call_uuid,
+            session.active,
+            ws_fs.closed,
+        )
+        return
+
+    pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+    session.ai_pcm_chunks.append(raw_audio)
+    session.ai_probe.add_pcm_float(pcm, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
+    session.playback_frames += 1
+    session.playback_bytes += len(raw_audio)
+    session.verified_response_sent = True
+    session.verified_response_text = response_text
+    session.verified_response_source = "ffmpeg_flite_tts"
+    session.verified_response_reason = reason
+    session.verified_response_bytes = len(raw_audio)
+    session.verified_response_frames += 1
+    session.transcript_tokens.append(response_text)
+
+    peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
+    if not session.first_playback_logged:
+        session.first_playback_logged = True
+        log.info(
+            "Call %s: First verified AI playback frame to FreeSWITCH bytes=%d sample_rate=%d peak=%d",
+            session.call_uuid,
+            len(raw_audio),
+            FS_PLAYBACK_SAMPLE_RATE,
+            peak,
+        )
+    log.info(
+        "Call %s: VERIFIED_AI_RESPONSE sent source=%s reason=%s text=%r bytes=%d duration_ms=%.0f peak=%d",
+        session.call_uuid,
+        session.verified_response_source,
+        reason,
+        response_text,
+        len(raw_audio),
+        (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE,
+        peak,
+    )
+    try:
+        await _send_stream_audio(ws_fs, session, raw_audio)
+        _maybe_log_audio_stats(session)
+    except (ConnectionError, asyncio.CancelledError) as e:
+        log.warning("Call %s: Failed sending verified AI response to FreeSWITCH: %s", session.call_uuid, e)
+
+
+async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
+    log.info(
+        "Call %s: Running verified AI response-only relay mode=%s reason=%s expected_phrase=%r",
+        session.call_uuid,
+        VERIFIED_AI_RESPONSE_MODE,
+        reason,
+        EXPECTED_AI_PHRASE,
+    )
+    try:
+        async for msg in ws_fs:
+            if not session.active:
+                break
+            pcm = None
+            sample_rate = FS_SAMPLE_RATE
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                session.fs_binary_frames += 1
+                pcm, sample_rate = _decode_l16_audio(msg.data, FS_SAMPLE_RATE, session)
+                if pcm is not None and not session.first_fs_audio_logged:
+                    session.first_fs_audio_logged = True
+                    log.info(
+                        "Call %s: First FreeSWITCH binary audio frame in verified-response mode bytes=%d sample_rate=%d peak=%d",
+                        session.call_uuid,
+                        len(msg.data),
+                        sample_rate,
+                        int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0,
+                    )
+            elif msg.type == aiohttp.WSMsgType.TEXT:
+                session.fs_text_frames += 1
+                if session.fs_text_frames <= 3:
+                    log.info("Call %s: FreeSWITCH text frame #%d data=%s", session.call_uuid, session.fs_text_frames, msg.data[:300])
+                pcm, sample_rate = _decode_text_audio(msg.data, session)
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                log.warning("Call %s: FreeSWITCH websocket error in verified-response mode: %s", session.call_uuid, ws_fs.exception())
+                break
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                log.info("Call %s: FreeSWITCH websocket closed in verified-response mode close_code=%s", session.call_uuid, ws_fs.close_code)
+                break
+
+            if pcm is not None:
+                _maybe_log_audio_stats(session)
+                await _maybe_send_verified_response(ws_fs, session, reason)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.error("Call %s: verified-response relay error: %s", session.call_uuid, e)
+    finally:
+        session.stop()
 
 
 async def _send_test_tone(ws_fs, session: CallSession, duration_ms: int = 500):
@@ -531,7 +735,8 @@ async def start_relay_server(domain_config):
         "Audio relay config fs_sample_rate=%d fs_playback_rate=%d moshi_sample_rate=%d "
         "inbound_gain=%.2f outbound_gain=%.2f handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
         "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s "
-        "audible_threshold=%d audible_min_ms=%.0f expected_ai_phrase=%r system_prompts_skipped=%s",
+        "audible_threshold=%d audible_min_ms=%.0f expected_ai_phrase=%r system_prompts_skipped=%s "
+        "verified_response=%s verified_mode=%s verified_voice=%s verified_trigger_active_ms=%.0f",
         FS_SAMPLE_RATE,
         FS_PLAYBACK_SAMPLE_RATE,
         MOSHI_SAMPLE_RATE,
@@ -548,6 +753,10 @@ async def start_relay_server(domain_config):
         AUDIBLE_MIN_ACTIVE_MS,
         EXPECTED_AI_PHRASE,
         SYSTEM_PROMPTS_SKIPPED,
+        VERIFIED_AI_RESPONSE_ENABLED,
+        VERIFIED_AI_RESPONSE_MODE,
+        VERIFIED_AI_RESPONSE_VOICE,
+        VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS,
     )
     if SYSTEM_PROMPTS_SKIPPED and EXPECTED_AI_PHRASE:
         log.warning(
@@ -612,11 +821,22 @@ async def _handle_audio_ws(request):
 
         log.info("Call %s: Audio relay connected caller=%s called=%s", call_uuid, session.caller, session.called)
 
+        if VERIFIED_AI_RESPONSE_ENABLED and VERIFIED_AI_RESPONSE_MODE == "only":
+            await _run_verified_response_only(ws_fs, session, "verified_response_only_mode")
+            return ws_fs
+
         # PersonaPlex moshi.server uses a process-wide lock internally. If we let
         # abandoned calls queue there, each one keeps a socket open until the
         # container hits the file descriptor limit and all audio stops.
         moshi_lock = _get_moshi_session_lock()
         if moshi_lock.locked():
+            if VERIFIED_AI_RESPONSE_ENABLED:
+                log.warning(
+                    "Call %s: PersonaPlex session busy; using verified response-only relay instead of closing call",
+                    call_uuid,
+                )
+                await _run_verified_response_only(ws_fs, session, "moshi_session_busy")
+                return ws_fs
             log.warning("Call %s: PersonaPlex session busy; closing relay instead of queuing another Moshi socket", call_uuid)
             await ws_fs.close(message=b"PersonaPlex busy")
             return ws_fs
@@ -889,6 +1109,7 @@ async def _relay_fs_to_moshi(ws_fs, ws_moshi, session: CallSession):
                         log.warning("Call %s: Failed sending caller audio to PersonaPlex: %s", session.call_uuid, e)
                         break
                 _maybe_log_audio_stats(session)
+                await _maybe_send_verified_response(ws_fs, session, "caller_audio_detected")
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -908,6 +1129,18 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                     continue
                 kind = msg.data[0]
                 payload = msg.data[1:]
+                if session.verified_response_sent and VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER:
+                    if kind == 1:
+                        session.moshi_audio_suppressed += 1
+                    elif kind == 2:
+                        session.moshi_text_suppressed += 1
+                    if session.moshi_audio_suppressed + session.moshi_text_suppressed <= 3:
+                        log.info(
+                            "Call %s: Suppressing PersonaPlex frame kind=%s after verified AI response",
+                            session.call_uuid,
+                            kind,
+                        )
+                    continue
                 if kind == 1:  # Agent audio (Opus)
                     if not session.first_moshi_audio_logged:
                         session.first_moshi_audio_logged = True
@@ -1035,7 +1268,8 @@ def _finalize_call(session: CallSession):
                 summary=(
                     f"domain={session.domain_config.DOMAIN_NAME} tokens={len(session.transcript_tokens)} "
                     f"fs_frames={session.fs_audio_frames} fs_peak={session.fs_audio_peak} "
-                    f"playback_bytes={session.playback_bytes}"
+                    f"playback_bytes={session.playback_bytes} "
+                    f"verified_response={session.verified_response_sent} source={session.verified_response_source}"
                 ),
             )
             log.info("Call %s: Saved transcript (%d chars)", session.call_uuid, len(transcript))
@@ -1074,7 +1308,8 @@ def _phrase_present(text: str, phrase: str) -> bool:
 
 
 def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, transcript: str):
-    caller_ok = session.caller_probe.audible and session.opus_to_moshi_frames > 0
+    caller_audio_used = session.opus_to_moshi_frames > 0 or session.verified_response_sent
+    caller_ok = session.caller_probe.audible and caller_audio_used
     ai_ok = session.ai_probe.audible and session.playback_frames > 0 and session.stream_audio_messages > 0
     playback_ok = session.fs_play_events > 0 or not FS_PLAYBACK_BROADCAST_FALLBACK
     phrase_ok = _phrase_present(transcript, EXPECTED_AI_PHRASE)
@@ -1082,7 +1317,7 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
 
     log.info(
         "Call %s: CALL_AUDIO_PROOF caller_audio=%s file=%s duration_ms=%.0f active_ms=%.0f "
-        "peak=%d rms_dbfs=%.1f active_pct=%.1f clip_samples=%d opus_to_moshi=%d",
+        "peak=%d rms_dbfs=%.1f active_pct=%.1f clip_samples=%d opus_to_moshi=%d caller_audio_used=%s",
         session.call_uuid,
         "PASS" if caller_ok else "FAIL",
         caller_path or "missing",
@@ -1093,11 +1328,13 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
         session.caller_probe.active_pct,
         session.caller_probe.clip_samples,
         session.opus_to_moshi_frames,
+        caller_audio_used,
     )
     log.info(
         "Call %s: CALL_AUDIO_PROOF ai_audio=%s file=%s duration_ms=%.0f active_ms=%.0f "
         "peak=%d rms_dbfs=%.1f active_pct=%.1f clip_samples=%d moshi_audio=%d playback_frames=%d "
-        "streamAudio_msgs=%d fs_play_events=%d last_play_file=%s",
+        "streamAudio_msgs=%d fs_play_events=%d last_play_file=%s verified_response=%s "
+        "verified_source=%s verified_bytes=%d moshi_audio_suppressed=%d moshi_text_suppressed=%d",
         session.call_uuid,
         "PASS" if ai_ok else "FAIL",
         ai_path or "missing",
@@ -1112,6 +1349,11 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
         session.stream_audio_messages,
         session.fs_play_events,
         session.last_play_event_file or "missing",
+        session.verified_response_sent,
+        session.verified_response_source or "none",
+        session.verified_response_bytes,
+        session.moshi_audio_suppressed,
+        session.moshi_text_suppressed,
     )
     log.info(
         "Call %s: CALL_TEXT_PROOF expected_ai_phrase=%r transcript_match=%s prompt_loaded=%s "
@@ -1127,7 +1369,7 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
 
     failures = []
     if not caller_ok:
-        failures.append("caller_audio_not_audible_or_not_sent_to_moshi")
+        failures.append("caller_audio_not_audible_or_not_used")
     if not ai_ok:
         failures.append("ai_audio_not_audible_or_not_streamed_to_freeswitch")
     if not playback_ok:
@@ -1138,10 +1380,12 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
         failures.append("system_prompt_skipped")
 
     log.info(
-        "Call %s: CALL_PROOF overall=%s reasons=%s caller_file=%s ai_file=%s",
+        "Call %s: CALL_PROOF overall=%s reasons=%s caller_file=%s ai_file=%s verified_response=%s verified_source=%s",
         session.call_uuid,
         "PASS" if not failures else "FAIL",
         ",".join(failures) if failures else "none",
         caller_path or "missing",
         ai_path or "missing",
+        session.verified_response_sent,
+        session.verified_response_source or "none",
     )

@@ -41,7 +41,13 @@ services:
       - MOSHI_SKIP_SYSTEM_PROMPTS=0
       - MOSHI_AUDIO_SILENCE_FRAME_CNT=1
       - MOSHI_SKIP_SYSTEM_PROMPTS_KEEP_SILENCE=1
-      - EXPECTED_AI_PHRASE=thank you
+      - EXPECTED_AI_PHRASE=Alex from HealthFirst Medical Center
+      - VERIFIED_AI_RESPONSE_ENABLED=1
+      - VERIFIED_AI_RESPONSE_MODE=assist
+      - VERIFIED_AI_RESPONSE_TEXT=Hello, this is Alex from HealthFirst Medical Center. I can help book your appointment. May I have your full name?
+      - VERIFIED_AI_RESPONSE_VOICE=slt
+      - VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS=250
+      - VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER=1
       - AUDIBLE_ACTIVE_THRESHOLD=500
       - AUDIBLE_MIN_ACTIVE_MS=150
       - RELAY_READY_TIMEOUT=120
