@@ -20,11 +20,14 @@ import base64
 import contextlib
 import asyncio
 import logging
+import math
 import time
 import traceback
 import json
+import re
 import struct
 import threading
+import wave
 from typing import Optional, List
 
 import numpy as np
@@ -60,6 +63,10 @@ FS_ESL_PASSWORD = os.getenv("FS_ESL_PASSWORD", "FS!Secure2026")
 FS_TEMP_DIR = os.getenv("FS_TEMP_DIR", "/tmp")
 FS_PLAYBACK_BROADCAST_FALLBACK = os.getenv("FS_PLAYBACK_BROADCAST_FALLBACK", "1").lower() in ("1", "true", "yes")
 FS_PLAYBACK_BROADCAST_DELAY = float(os.getenv("FS_PLAYBACK_BROADCAST_DELAY", "0.25"))
+AUDIBLE_ACTIVE_THRESHOLD = int(os.getenv("AUDIBLE_ACTIVE_THRESHOLD", "500"))
+AUDIBLE_MIN_ACTIVE_MS = float(os.getenv("AUDIBLE_MIN_ACTIVE_MS", "250"))
+EXPECTED_AI_PHRASE = os.getenv("EXPECTED_AI_PHRASE", "thank you").strip()
+SYSTEM_PROMPTS_SKIPPED = os.getenv("MOSHI_SKIP_SYSTEM_PROMPTS", "0").lower() in ("1", "true", "yes")
 
 # mod_audio_stream sends L16 at this rate
 FS_SAMPLE_RATE = 16000
@@ -67,6 +74,58 @@ FS_SAMPLE_RATE = 16000
 FS_PLAYBACK_SAMPLE_RATE = int(os.getenv("FS_PLAYBACK_SAMPLE_RATE", str(FS_SAMPLE_RATE)))
 # PersonaPlex operates at 24kHz
 MOSHI_SAMPLE_RATE = 24000
+
+
+class AudioProbe:
+    """Compact audio evidence for a stream without keeping every sample in memory."""
+
+    def __init__(self):
+        self.frames = 0
+        self.bytes = 0
+        self.samples = 0
+        self.duration_ms = 0.0
+        self.active_ms = 0.0
+        self.peak = 0
+        self.sum_squares = 0.0
+        self.clip_samples = 0
+
+    def add_pcm_float(self, pcm, sample_rate: int, byte_count: int = 0):
+        arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or sample_rate <= 0:
+            return
+        clipped = np.clip(arr, -1.0, 1.0)
+        abs_i16 = np.abs(clipped) * 32767.0
+        self.frames += 1
+        self.bytes += int(byte_count)
+        self.samples += int(arr.size)
+        self.duration_ms += (arr.size * 1000.0) / sample_rate
+        self.active_ms += (int(np.count_nonzero(abs_i16 >= AUDIBLE_ACTIVE_THRESHOLD)) * 1000.0) / sample_rate
+        self.peak = max(self.peak, int(np.max(abs_i16)))
+        self.sum_squares += float(np.sum(np.square(clipped, dtype=np.float64)))
+        self.clip_samples += int(np.count_nonzero(abs_i16 >= 32700))
+
+    @property
+    def rms(self) -> float:
+        if self.samples <= 0:
+            return 0.0
+        return math.sqrt(self.sum_squares / self.samples) * 32767.0
+
+    @property
+    def rms_dbfs(self) -> float:
+        rms = self.rms
+        if rms <= 0:
+            return -120.0
+        return 20.0 * math.log10(min(rms / 32767.0, 1.0))
+
+    @property
+    def active_pct(self) -> float:
+        if self.duration_ms <= 0:
+            return 0.0
+        return min(100.0, (self.active_ms / self.duration_ms) * 100.0)
+
+    @property
+    def audible(self) -> bool:
+        return self.peak >= AUDIBLE_ACTIVE_THRESHOLD and self.active_ms >= AUDIBLE_MIN_ACTIVE_MS
 
 
 class CallSession:
@@ -102,6 +161,13 @@ class CallSession:
         self.first_moshi_audio_logged = False
         self.first_playback_logged = False
         self.stream_audio_messages = 0
+        self.stream_audio_bytes = 0
+        self.fs_play_events = 0
+        self.last_play_event_file = ""
+        self.ai_pcm_chunks: List[bytes] = []
+        self.caller_pcm_chunks: List[bytes] = []
+        self.caller_probe = AudioProbe()
+        self.ai_probe = AudioProbe()
 
     @property
     def active(self):
@@ -172,12 +238,17 @@ async def _broadcast_stream_audio_file_later(session: CallSession, stream_index:
 
     try:
         result = await asyncio.to_thread(_broadcast)
+        result_text = result.strip()
+        if result_text.startswith("+OK"):
+            session.fs_play_events += 1
+            session.last_play_event_file = file_path
         log.info(
-            "Call %s: fallback uuid_broadcast streamAudio file index=%d path=%s -> %s",
+            "Call %s: fallback uuid_broadcast streamAudio file index=%d path=%s -> %s playback_confirmed=%s",
             session.call_uuid,
             stream_index,
             file_path,
-            result.strip()[:200],
+            result_text[:200],
+            result_text.startswith("+OK"),
         )
     except Exception as e:
         log.warning("Call %s: fallback uuid_broadcast failed for %s: %s", session.call_uuid, file_path, e)
@@ -187,6 +258,7 @@ async def _send_stream_audio(ws_fs, session: CallSession, raw_audio: bytes):
     stream_index = session.stream_audio_messages
     session.stream_audio_messages += 1
     await ws_fs.send_str(json.dumps(_stream_audio_message(raw_audio)))
+    session.stream_audio_bytes += len(raw_audio)
     if FS_PLAYBACK_BROADCAST_FALLBACK:
         asyncio.create_task(_broadcast_stream_audio_file_later(session, stream_index))
 
@@ -241,6 +313,10 @@ def _decode_l16_audio(data: bytes, sample_rate: int, session: CallSession):
     session.fs_audio_bytes += len(data)
     if pcm.size:
         session.fs_audio_peak = max(session.fs_audio_peak, int(np.max(np.abs(pcm)) * 32767))
+        session.caller_probe.add_pcm_float(pcm, sample_rate, len(data))
+        caller_l16 = _pcm_float_to_l16_bytes(_resample_linear(pcm, sample_rate, FS_SAMPLE_RATE))
+        if caller_l16:
+            session.caller_pcm_chunks.append(caller_l16)
     return pcm, sample_rate
 
 
@@ -282,6 +358,12 @@ def _resample_linear(pcm, from_rate: int, to_rate: int):
     return np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
 
 
+def _pcm_float_to_l16_bytes(pcm) -> bytes:
+    if pcm.size == 0:
+        return b""
+    return (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+
 def _maybe_log_audio_stats(session: CallSession):
     now = time.time()
     if now - session.last_audio_log < AUDIO_STATS_INTERVAL:
@@ -292,20 +374,37 @@ def _maybe_log_audio_stats(session: CallSession):
 
 def _log_audio_stats(session: CallSession, label: str):
     log.info(
-        "Call %s: %s fs_frames=%d fs_bytes=%d fs_peak=%d fs_text=%d fs_binary=%d opus_to_moshi=%d "
-        "moshi_audio=%d moshi_text=%d playback_frames=%d playback_bytes=%d active=%s",
+        "Call %s: %s fs_frames=%d fs_bytes=%d fs_peak=%d caller_ms=%.0f caller_active_ms=%.0f "
+        "caller_rms_dbfs=%.1f caller_clip=%d caller_audible=%s fs_text=%d fs_binary=%d opus_to_moshi=%d "
+        "moshi_audio=%d moshi_text=%d ai_ms=%.0f ai_active_ms=%.0f ai_peak=%d ai_rms_dbfs=%.1f "
+        "ai_clip=%d ai_audible=%s playback_frames=%d playback_bytes=%d streamAudio_msgs=%d streamAudio_bytes=%d "
+        "fs_play_events=%d active=%s",
         session.call_uuid,
         label,
         session.fs_audio_frames,
         session.fs_audio_bytes,
         session.fs_audio_peak,
+        session.caller_probe.duration_ms,
+        session.caller_probe.active_ms,
+        session.caller_probe.rms_dbfs,
+        session.caller_probe.clip_samples,
+        session.caller_probe.audible,
         session.fs_text_frames,
         session.fs_binary_frames,
         session.opus_to_moshi_frames,
         session.moshi_audio_frames,
         session.moshi_text_frames,
+        session.ai_probe.duration_ms,
+        session.ai_probe.active_ms,
+        session.ai_probe.peak,
+        session.ai_probe.rms_dbfs,
+        session.ai_probe.clip_samples,
+        session.ai_probe.audible,
         session.playback_frames,
         session.playback_bytes,
+        session.stream_audio_messages,
+        session.stream_audio_bytes,
+        session.fs_play_events,
         session.active,
     )
 
@@ -431,7 +530,8 @@ async def start_relay_server(domain_config):
     log.info(
         "Audio relay config fs_sample_rate=%d fs_playback_rate=%d moshi_sample_rate=%d "
         "inbound_gain=%.2f outbound_gain=%.2f handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
-        "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s",
+        "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s "
+        "audible_threshold=%d audible_min_ms=%.0f expected_ai_phrase=%r system_prompts_skipped=%s",
         FS_SAMPLE_RATE,
         FS_PLAYBACK_SAMPLE_RATE,
         MOSHI_SAMPLE_RATE,
@@ -444,7 +544,16 @@ async def start_relay_server(domain_config):
         OUTBOUND_TEST_TONE_DELAY,
         OUTBOUND_TEST_TONE_DURATION_MS,
         OUTBOUND_TEST_TONE_CALLER or "none",
+        AUDIBLE_ACTIVE_THRESHOLD,
+        AUDIBLE_MIN_ACTIVE_MS,
+        EXPECTED_AI_PHRASE,
+        SYSTEM_PROMPTS_SKIPPED,
     )
+    if SYSTEM_PROMPTS_SKIPPED and EXPECTED_AI_PHRASE:
+        log.warning(
+            "Audio proof warning: MOSHI_SKIP_SYSTEM_PROMPTS=1, so the persona prompt rule for expected_ai_phrase=%r is not enforced.",
+            EXPECTED_AI_PHRASE,
+        )
     if MOSHI_PREWARM:
         app["moshi_prewarm_task"] = asyncio.create_task(_prewarm_moshi_loop(app, domain_config))
     return runner
@@ -812,6 +921,8 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                         # Convert to L16 (16-bit signed LE) for mod_audio_stream streamAudio.
                         l16 = (np.clip(pcm_fs, -1.0, 1.0) * 32767).astype(np.int16)
                         raw_audio = l16.tobytes()
+                        session.ai_pcm_chunks.append(raw_audio)
+                        session.ai_probe.add_pcm_float(pcm_fs, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
                         session.moshi_audio_frames += 1
                         session.playback_frames += 1
                         session.playback_bytes += len(raw_audio)
@@ -859,6 +970,25 @@ def _forget_session(session: CallSession):
             _sessions.pop(session.call_uuid, None)
 
 
+def mark_play_event(call_uuid: str, file_path: str = ""):
+    with _sessions_lock:
+        session = _sessions.get(call_uuid)
+    if not session:
+        log.info("Call %s: FreeSWITCH playback event for unknown/inactive session file=%s", call_uuid, file_path or "missing")
+        return
+    session.fs_play_events += 1
+    if file_path:
+        session.last_play_event_file = file_path
+    log.info(
+        "Call %s: FreeSWITCH playback event #%d file=%s streamAudio_msgs=%d streamAudio_bytes=%d",
+        call_uuid,
+        session.fs_play_events,
+        file_path or "missing",
+        session.stream_audio_messages,
+        session.stream_audio_bytes,
+    )
+
+
 def register_session(call_uuid: str, caller: str, called: str,
                      domain_config, call_id: Optional[int] = None) -> CallSession:
     """Register a new call session (called from the ESL event handler)."""
@@ -887,7 +1017,16 @@ def _finalize_call(session: CallSession):
     if session.finalized:
         return
     session.finalized = True
+    caller_path = ""
+    ai_path = ""
+    if session.caller_pcm_chunks:
+        caller_path = FS_TEMP_DIR.rstrip("/") + "/personaplex_caller_direct_" + session.call_uuid + ".wav"
+        _save_pcm_wav(session, caller_path, session.caller_pcm_chunks, FS_SAMPLE_RATE, "caller")
+    if session.ai_pcm_chunks:
+        ai_path = FS_TEMP_DIR.rstrip("/") + "/personaplex_ai_direct_" + session.call_uuid + ".wav"
+        _save_pcm_wav(session, ai_path, session.ai_pcm_chunks, FS_PLAYBACK_SAMPLE_RATE, "AI")
     transcript = "".join(session.transcript_tokens).strip()
+    _log_audio_proof(session, caller_path, ai_path, transcript)
     if session.call_id:
         try:
             db.end_call(
@@ -902,3 +1041,107 @@ def _finalize_call(session: CallSession):
             log.info("Call %s: Saved transcript (%d chars)", session.call_uuid, len(transcript))
         except Exception as e:
             log.error("Call %s: DB end_call failed: %s", session.call_uuid, e)
+
+
+def _save_pcm_wav(session: CallSession, path: str, chunks: List[bytes], sample_rate: int, label: str):
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes(b"".join(chunks))
+        log.info(
+            "Call %s: Saved direct %s audio %s chunks=%d bytes=%d sample_rate=%d",
+            session.call_uuid,
+            label,
+            path,
+            len(chunks),
+            sum(len(chunk) for chunk in chunks),
+            sample_rate,
+        )
+    except Exception as e:
+        log.error("Call %s: Failed saving direct %s audio: %s", session.call_uuid, label, e)
+
+
+def _phrase_present(text: str, phrase: str) -> bool:
+    if not phrase:
+        return True
+    text_clean = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
+    phrase_clean = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", phrase.lower())).strip()
+    text_compact = re.sub(r"[^a-z0-9]+", "", text.lower())
+    phrase_compact = re.sub(r"[^a-z0-9]+", "", phrase.lower())
+    return bool(phrase_clean and phrase_clean in text_clean) or bool(phrase_compact and phrase_compact in text_compact)
+
+
+def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, transcript: str):
+    caller_ok = session.caller_probe.audible and session.opus_to_moshi_frames > 0
+    ai_ok = session.ai_probe.audible and session.playback_frames > 0 and session.stream_audio_messages > 0
+    playback_ok = session.fs_play_events > 0 or not FS_PLAYBACK_BROADCAST_FALLBACK
+    phrase_ok = _phrase_present(transcript, EXPECTED_AI_PHRASE)
+    prompt_ok = not SYSTEM_PROMPTS_SKIPPED
+
+    log.info(
+        "Call %s: CALL_AUDIO_PROOF caller_audio=%s file=%s duration_ms=%.0f active_ms=%.0f "
+        "peak=%d rms_dbfs=%.1f active_pct=%.1f clip_samples=%d opus_to_moshi=%d",
+        session.call_uuid,
+        "PASS" if caller_ok else "FAIL",
+        caller_path or "missing",
+        session.caller_probe.duration_ms,
+        session.caller_probe.active_ms,
+        session.caller_probe.peak,
+        session.caller_probe.rms_dbfs,
+        session.caller_probe.active_pct,
+        session.caller_probe.clip_samples,
+        session.opus_to_moshi_frames,
+    )
+    log.info(
+        "Call %s: CALL_AUDIO_PROOF ai_audio=%s file=%s duration_ms=%.0f active_ms=%.0f "
+        "peak=%d rms_dbfs=%.1f active_pct=%.1f clip_samples=%d moshi_audio=%d playback_frames=%d "
+        "streamAudio_msgs=%d fs_play_events=%d last_play_file=%s",
+        session.call_uuid,
+        "PASS" if ai_ok else "FAIL",
+        ai_path or "missing",
+        session.ai_probe.duration_ms,
+        session.ai_probe.active_ms,
+        session.ai_probe.peak,
+        session.ai_probe.rms_dbfs,
+        session.ai_probe.active_pct,
+        session.ai_probe.clip_samples,
+        session.moshi_audio_frames,
+        session.playback_frames,
+        session.stream_audio_messages,
+        session.fs_play_events,
+        session.last_play_event_file or "missing",
+    )
+    log.info(
+        "Call %s: CALL_TEXT_PROOF expected_ai_phrase=%r transcript_match=%s prompt_loaded=%s "
+        "moshi_text_frames=%d transcript_chars=%d transcript=%r",
+        session.call_uuid,
+        EXPECTED_AI_PHRASE,
+        "PASS" if phrase_ok else "FAIL",
+        "PASS" if prompt_ok else "FAIL",
+        session.moshi_text_frames,
+        len(transcript),
+        transcript[:500],
+    )
+
+    failures = []
+    if not caller_ok:
+        failures.append("caller_audio_not_audible_or_not_sent_to_moshi")
+    if not ai_ok:
+        failures.append("ai_audio_not_audible_or_not_streamed_to_freeswitch")
+    if not playback_ok:
+        failures.append("no_freeswitch_playback_event")
+    if not phrase_ok:
+        failures.append("expected_ai_phrase_not_seen_in_moshi_text")
+    if not prompt_ok:
+        failures.append("system_prompt_skipped")
+
+    log.info(
+        "Call %s: CALL_PROOF overall=%s reasons=%s caller_file=%s ai_file=%s",
+        session.call_uuid,
+        "PASS" if not failures else "FAIL",
+        ",".join(failures) if failures else "none",
+        caller_path or "missing",
+        ai_path or "missing",
+    )

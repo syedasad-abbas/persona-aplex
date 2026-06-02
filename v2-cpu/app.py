@@ -107,7 +107,7 @@ def _esl_event_loop(domain_config):
     to pipe audio to the relay WebSocket.
     """
     from esl_client import ESLClient
-    from bridge import register_session, unregister_session, FS_SAMPLE_RATE
+    from bridge import register_session, unregister_session, mark_play_event, FS_SAMPLE_RATE
     import db
     import re
 
@@ -146,13 +146,14 @@ def _esl_event_loop(domain_config):
                                     except json.JSONDecodeError:
                                         file_path = ""
                                 if file_path:
-                                        play_esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
-                                        try:
-                                            play_esl.connect()
-                                            play_result = play_esl.api("uuid_broadcast", f"{uuid} {file_path} aleg")
-                                            log.info("Call %s: uuid_broadcast %s → %s", uuid, file_path, play_result.strip()[:200])
-                                        finally:
-                                            play_esl.close()
+                                    mark_play_event(uuid, file_path)
+                                    play_esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
+                                    try:
+                                        play_esl.connect()
+                                        play_result = play_esl.api("uuid_broadcast", f"{uuid} {file_path} aleg")
+                                        log.info("Call %s: uuid_broadcast %s -> %s", uuid, file_path, play_result.strip()[:200])
+                                    finally:
+                                        play_esl.close()
                         continue
 
                     if name in ("CHANNEL_ANSWER", "CHANNEL_PARK") and uuid and uuid not in stream_started:

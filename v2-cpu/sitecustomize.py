@@ -44,12 +44,18 @@ if _moshi_lm is not None:
 
 
     if os.getenv("MOSHI_SKIP_SYSTEM_PROMPTS", "0").lower() in ("1", "true", "yes"):
+        _keep_silence = os.getenv("MOSHI_SKIP_SYSTEM_PROMPTS_KEEP_SILENCE", "1").lower() in ("1", "true", "yes")
+
         async def _skip_system_prompts_async(self, mimi, is_alive=None):
-            print("Skipping system prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            print("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            if _keep_silence:
+                await self._step_audio_silence_async(is_alive)
             return None
 
         def _skip_system_prompts(self, mimi):
-            print("Skipping system prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            print("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            if _keep_silence:
+                self._step_audio_silence()
             return None
 
         _moshi_lm.LMGen.step_system_prompts_async = _skip_system_prompts_async

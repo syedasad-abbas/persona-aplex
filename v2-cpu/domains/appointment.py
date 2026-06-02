@@ -10,11 +10,7 @@ DEFAULT_VOICE_PROMPT = "NATF2.pt"
 
 # Text prompt in PersonaPlex's customer-service style.
 # PersonaPlex wraps this in <system> tags internally.
-TEXT_PROMPT = (
-    "You are Alex, a clinic appointment agent. "
-    "Book visits only. Ask for name, phone, reason, date, and time. "
-    "Confirm before booking."
-)
+TEXT_PROMPT = "If caller says congratulations, say thank you."
 
 REQUIRED_FIELDS = [
     "caller_name",
