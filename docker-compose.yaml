@@ -4,6 +4,7 @@ services:
     environment:
       - FS_PUBLIC_IP=${FS_PUBLIC_IP:-}
       - FS_PUBLIC_IP_URL=${FS_PUBLIC_IP_URL:-https://api.ipify.org}
+      - FS_SIP_DOMAIN=${FS_SIP_DOMAIN:-}
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"

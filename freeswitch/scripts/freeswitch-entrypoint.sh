@@ -52,22 +52,26 @@ detect_public_ip() {
 update_vars_file() {
   file="$1"
   ip="$2"
+  sip_domain="$3"
   [ -f "$file" ] || return 0
 
   sed -i -E \
     -e "s#data=\"external_rtp_ip=[^\"]*\"#data=\"external_rtp_ip=${ip}\"#" \
     -e "s#data=\"external_sip_ip=[^\"]*\"#data=\"external_sip_ip=${ip}\"#" \
+    -e "s#data=\"domain_name=[^\"]*\"#data=\"domain_name=${sip_domain}\"#" \
+    -e "s#data=\"domain=[^\"]*\"#data=\"domain=${sip_domain}\"#" \
     "$file"
 }
 
 if ip="$(detect_public_ip)"; then
   if valid_ipv4 "$ip"; then
+    sip_domain="${FS_SIP_DOMAIN:-$ip}"
     for vars_file in \
       /usr/local/freeswitch/vars.xml \
       /usr/local/freeswitch/conf/vars.xml; do
-      update_vars_file "$vars_file" "$ip"
+      update_vars_file "$vars_file" "$ip" "$sip_domain"
     done
-    log "Using external_sip_ip/external_rtp_ip=${ip}"
+    log "Using external_sip_ip/external_rtp_ip=${ip}, domain=${sip_domain}"
   else
     log "Detected invalid public IP '${ip}', leaving vars.xml unchanged"
   fi
