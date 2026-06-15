@@ -292,9 +292,9 @@
        If unspecified, the bind_server_ip value is used.
        Used by: sofia.conf.xml dingaling.conf.xml
   -->
-  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=169.197.92.97"/>
+  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=192.169.46.42"/>
   <X-PRE-PROCESS cmd="set" data="rtp-start-port=4000"/>
-  <X-PRE-PROCESS cmd="set" data="rtp-end-port=6000"/>
+  <X-PRE-PROCESS cmd="set" data="rtp-end-port=4100"/>
 
   <!-- external_sip_ip
       Used as the public IP address for SDP.
@@ -307,7 +307,7 @@
        If unspecified, the bind_server_ip value is used.
        Used by: sofia.conf.xml dingaling.conf.xml
   -->
-  <X-PRE-PROCESS cmd="set" data="external_sip_ip=169.197.92.97"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_ip=192.169.46.42"/>
 
   <!-- unroll-loops
        Used to turn on sip loopback unrolling.
@@ -324,7 +324,7 @@
 
   <!-- various debug and defaults -->
   <X-PRE-PROCESS cmd="set" data="call_debug=false"/>
-  <X-PRE-PROCESS cmd="set" data="console_loglevel=info"/>
+  <X-PRE-PROCESS cmd="set" data="console_loglevel=debug"/>
   <X-PRE-PROCESS cmd="set" data="default_areacode=918"/>
   <X-PRE-PROCESS cmd="set" data="default_country=US"/>
 
@@ -415,13 +415,13 @@
 
   <!-- Internal SIP Profile -->
   <X-PRE-PROCESS cmd="set" data="internal_auth_calls=true"/>
-  <X-PRE-PROCESS cmd="set" data="internal_sip_port=5080"/>
+  <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060"/>
   <X-PRE-PROCESS cmd="set" data="internal_tls_port=5061"/>
   <X-PRE-PROCESS cmd="set" data="internal_ssl_enable=false"/>
 
   <!-- External SIP Profile -->
   <X-PRE-PROCESS cmd="set" data="external_auth_calls=false"/>
-  <X-PRE-PROCESS cmd="set" data="external_sip_port=5060"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_port=5080"/>
   <X-PRE-PROCESS cmd="set" data="external_tls_port=5081"/>
   <X-PRE-PROCESS cmd="set" data="external_ssl_enable=false"/>
 

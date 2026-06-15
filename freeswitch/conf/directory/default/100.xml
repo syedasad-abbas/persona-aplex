@@ -1,0 +1,16 @@
+<include>
+  <user id="100">
+    <params>
+      <param name="password" value="$${default_password}"/>
+      <param name="vm-password" value="100"/>
+    </params>
+
+    <variables>
+      <variable name="toll_allow" value="local,domestic"/>
+      <variable name="accountcode" value="100"/>
+      <variable name="user_context" value="public"/>
+      <variable name="effective_caller_id_name" value="Extension 100"/>
+      <variable name="effective_caller_id_number" value="100"/>
+    </variables>
+  </user>
+</include>

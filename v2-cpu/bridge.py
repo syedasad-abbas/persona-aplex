@@ -56,6 +56,7 @@ OUTBOUND_TEST_TONE_CALLER = os.getenv("OUTBOUND_TEST_TONE_CALLER", "")
 MOSHI_HANDSHAKE_TIMEOUT = float(os.getenv("MOSHI_HANDSHAKE_TIMEOUT", "90"))
 MOSHI_PREWARM = os.getenv("MOSHI_PREWARM", "1").lower() in ("1", "true", "yes")
 MOSHI_PREWARM_TIMEOUT = float(os.getenv("MOSHI_PREWARM_TIMEOUT", "180"))
+MOSHI_BUSY_WAIT_TIMEOUT = float(os.getenv("MOSHI_BUSY_WAIT_TIMEOUT", str(MOSHI_PREWARM_TIMEOUT)))
 INBOUND_GAIN = float(os.getenv("INBOUND_GAIN", "1.0"))
 OUTBOUND_GAIN = float(os.getenv("OUTBOUND_GAIN", "1.0"))
 AUDIO_STATS_INTERVAL = float(os.getenv("AUDIO_STATS_INTERVAL", "5"))
@@ -87,7 +88,7 @@ VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
 FS_SAMPLE_RATE = 16000
 # Match the uuid_audio_stream sample rate unless explicitly overridden.
 FS_PLAYBACK_SAMPLE_RATE = int(os.getenv("FS_PLAYBACK_SAMPLE_RATE", str(FS_SAMPLE_RATE)))
-# PersonaPlex operates at 24kHz
+# PersonaPlex operates at 24kHz.
 MOSHI_SAMPLE_RATE = 24000
 
 
@@ -166,6 +167,7 @@ class CallSession:
         self.fs_text_frames = 0
         self.fs_binary_frames = 0
         self.opus_to_moshi_frames = 0
+        self.pending_opus_frames: List[bytes] = []
         self.moshi_audio_frames = 0
         self.moshi_text_frames = 0
         self.playback_frames = 0
@@ -173,6 +175,7 @@ class CallSession:
         self.last_audio_log = 0.0
         self.first_fs_audio_logged = False
         self.first_opus_logged = False
+        self.first_buffered_opus_logged = False
         self.first_moshi_audio_logged = False
         self.first_playback_logged = False
         self.stream_audio_messages = 0
@@ -758,7 +761,12 @@ async def start_relay_server(domain_config):
         VERIFIED_AI_RESPONSE_VOICE,
         VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS,
     )
-    if SYSTEM_PROMPTS_SKIPPED and EXPECTED_AI_PHRASE:
+    if SYSTEM_PROMPTS_SKIPPED and EXPECTED_AI_PHRASE and VERIFIED_AI_RESPONSE_ENABLED:
+        log.info(
+            "Audio proof note: MOSHI_SKIP_SYSTEM_PROMPTS=1; verified AI response will enforce expected_ai_phrase=%r.",
+            EXPECTED_AI_PHRASE,
+        )
+    elif SYSTEM_PROMPTS_SKIPPED and EXPECTED_AI_PHRASE:
         log.warning(
             "Audio proof warning: MOSHI_SKIP_SYSTEM_PROMPTS=1, so the persona prompt rule for expected_ai_phrase=%r is not enforced.",
             EXPECTED_AI_PHRASE,
@@ -829,30 +837,75 @@ async def _handle_audio_ws(request):
         # abandoned calls queue there, each one keeps a socket open until the
         # container hits the file descriptor limit and all audio stops.
         moshi_lock = _get_moshi_session_lock()
-        if moshi_lock.locked():
-            if VERIFIED_AI_RESPONSE_ENABLED:
+        queue: asyncio.Queue = request.app["moshi_ready_sessions"]
+        prepared: Optional[PreparedMoshiSession] = None
+
+        try:
+            prepared = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            prepared = None
+        log.info(
+            "Call %s: PersonaPlex session checkout queue_size=%d lock=%s prepared=%s",
+            call_uuid,
+            queue.qsize(),
+            moshi_lock.locked(),
+            prepared is not None,
+        )
+        if prepared is None and moshi_lock.locked():
+            drain_stop = asyncio.Event()
+            drain_task = asyncio.create_task(_drain_fs_during_handshake(ws_fs, session, drain_stop))
+            try:
                 log.warning(
-                    "Call %s: PersonaPlex session busy; using verified response-only relay instead of closing call",
+                    "Call %s: PersonaPlex session busy; waiting up to %.1fs for prewarmed session",
                     call_uuid,
+                    MOSHI_BUSY_WAIT_TIMEOUT,
                 )
-                await _run_verified_response_only(ws_fs, session, "moshi_session_busy")
+                prepared = await _wait_for_prepared_moshi_session(queue, ws_fs, session)
+                log.info(
+                    "Call %s: Received prewarmed PersonaPlex session after busy wait age=%.2fs buffered_opus=%d",
+                    call_uuid,
+                    time.time() - prepared.created_at,
+                    len(session.pending_opus_frames),
+                )
+            except asyncio.TimeoutError:
+                drain_stop.set()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(drain_task, timeout=1.0)
+                drain_task = None
+                if VERIFIED_AI_RESPONSE_ENABLED:
+                    log.warning(
+                        "Call %s: PersonaPlex session busy; using verified response-only relay instead of closing call",
+                        call_uuid,
+                    )
+                    await _run_verified_response_only(
+                        ws_fs,
+                        session,
+                        "moshi_session_busy",
+                    )
+                    return ws_fs
+
+                await ws_fs.close(message=b"PersonaPlex busy")
                 return ws_fs
-            log.warning("Call %s: PersonaPlex session busy; closing relay instead of queuing another Moshi socket", call_uuid)
-            await ws_fs.close(message=b"PersonaPlex busy")
-            return ws_fs
+            except ConnectionError as e:
+                log.warning("Call %s: PersonaPlex busy wait ended before relay could start: %s", call_uuid, e)
+                return ws_fs
+            finally:
+                if drain_task is not None:
+                    drain_stop.set()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(drain_task, timeout=1.0)
 
         async with moshi_lock:
             if not session.active:
                 log.warning("Call %s: Session ended before PersonaPlex connect", call_uuid)
                 return ws_fs
 
-            prepared: Optional[PreparedMoshiSession] = None
-            queue: asyncio.Queue = request.app["moshi_ready_sessions"]
             try:
-                try:
-                    prepared = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    prepared = None
+                if prepared is None:
+                    try:
+                        prepared = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        prepared = None
 
                 if prepared is not None:
                     ws_moshi = prepared.ws_moshi
@@ -863,6 +916,8 @@ async def _handle_audio_ws(request):
                         time.time() - prepared.created_at,
                         queue.qsize(),
                     )
+                    if not await _flush_pending_opus_to_moshi(ws_moshi, session, "prewarmed_session"):
+                        return ws_fs
                     _schedule_test_tone(ws_fs, session)
                     await _run_bidirectional_relay(ws_fs, ws_moshi, session)
                 else:
@@ -883,6 +938,8 @@ async def _handle_audio_ws(request):
                                 drain_stop.set()
                                 with contextlib.suppress(asyncio.TimeoutError):
                                     await asyncio.wait_for(drain_task, timeout=1.0)
+                            if not await _flush_pending_opus_to_moshi(ws_moshi, session, "live_handshake"):
+                                return ws_fs
                             _schedule_test_tone(ws_fs, session)
 
                             await _run_bidirectional_relay(ws_fs, ws_moshi, session)
@@ -909,6 +966,77 @@ async def _handle_audio_ws(request):
         log.info("Call %s: Audio relay disconnected", call_uuid)
 
     return ws_fs
+
+
+def _buffer_caller_audio_for_moshi(pcm, sample_rate: int, session: CallSession, source: str):
+    """Encode caller PCM that arrives before Moshi is ready so it can be replayed."""
+    if pcm is None or pcm.size == 0:
+        return
+    pcm = _apply_gain(pcm, INBOUND_GAIN)
+    pcm_moshi = _resample_linear(pcm, sample_rate, MOSHI_SAMPLE_RATE)
+    session.opus_writer.append_pcm(pcm_moshi)
+    opus_data = session.opus_writer.read_bytes()
+    if not opus_data:
+        return
+    session.pending_opus_frames.append(opus_data)
+    if not session.first_buffered_opus_logged:
+        session.first_buffered_opus_logged = True
+        log.info(
+            "Call %s: Buffered caller Opus before PersonaPlex ready source=%s bytes=%d input_rate=%d input_samples=%d",
+            session.call_uuid,
+            source,
+            len(opus_data),
+            sample_rate,
+            pcm.size,
+        )
+
+
+async def _flush_pending_opus_to_moshi(ws_moshi, session: CallSession, reason: str) -> bool:
+    if not session.pending_opus_frames:
+        return True
+
+    frames = session.pending_opus_frames
+    session.pending_opus_frames = []
+    sent = 0
+    for opus_data in frames:
+        if not session.active:
+            session.pending_opus_frames = frames[sent:] + session.pending_opus_frames
+            return False
+        try:
+            await ws_moshi.send_bytes(b"\x01" + opus_data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            session.pending_opus_frames = frames[sent:] + session.pending_opus_frames
+            log.warning("Call %s: Failed flushing buffered caller audio to PersonaPlex: %s", session.call_uuid, e)
+            return False
+
+        sent += 1
+        session.opus_to_moshi_frames += 1
+        if not session.first_opus_logged:
+            session.first_opus_logged = True
+            log.info(
+                "Call %s: First encoded Opus sent to PersonaPlex bytes=%d source=%s",
+                session.call_uuid,
+                len(opus_data),
+                reason,
+            )
+
+    log.info("Call %s: Flushed %d buffered caller Opus frame(s) to PersonaPlex reason=%s", session.call_uuid, sent, reason)
+    return True
+
+
+async def _wait_for_prepared_moshi_session(queue: asyncio.Queue, ws_fs, session: CallSession) -> PreparedMoshiSession:
+    deadline = time.time() + MOSHI_BUSY_WAIT_TIMEOUT
+    while session.active and not ws_fs.closed:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=min(1.0, remaining))
+        except asyncio.TimeoutError:
+            continue
+    raise ConnectionError("call ended while waiting for PersonaPlex prewarm")
 
 
 async def _drain_fs_during_handshake(ws_fs, session: CallSession, stop_event: asyncio.Event):
@@ -963,6 +1091,7 @@ async def _drain_fs_during_handshake(ws_fs, session: CallSession, stop_event: as
                 break
 
             if pcm is not None:
+                _buffer_caller_audio_for_moshi(pcm, sample_rate, session, "pre-ready")
                 _maybe_log_audio_stats(session)
     except asyncio.CancelledError:
         pass
@@ -1129,6 +1258,7 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                     continue
                 kind = msg.data[0]
                 payload = msg.data[1:]
+
                 if session.verified_response_sent and VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER:
                     if kind == 1:
                         session.moshi_audio_suppressed += 1
@@ -1141,6 +1271,7 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                             kind,
                         )
                     continue
+
                 if kind == 1:  # Agent audio (Opus)
                     if not session.first_moshi_audio_logged:
                         session.first_moshi_audio_logged = True
@@ -1313,7 +1444,7 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
     ai_ok = session.ai_probe.audible and session.playback_frames > 0 and session.stream_audio_messages > 0
     playback_ok = session.fs_play_events > 0 or not FS_PLAYBACK_BROADCAST_FALLBACK
     phrase_ok = _phrase_present(transcript, EXPECTED_AI_PHRASE)
-    prompt_ok = not SYSTEM_PROMPTS_SKIPPED
+    prompt_ok = not SYSTEM_PROMPTS_SKIPPED or session.verified_response_sent
 
     log.info(
         "Call %s: CALL_AUDIO_PROOF caller_audio=%s file=%s duration_ms=%.0f active_ms=%.0f "

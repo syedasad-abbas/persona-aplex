@@ -47,10 +47,10 @@
     <!-- Can be set to "_undef_" to remove the User-Agent header -->
     <!-- <param name="user-agent-string" value="FreeSWITCH Rocks!"/> -->
 
-    <param name="debug" value="0"/>
+    <param name="debug" value="1"/>
     <!-- If you want FreeSWITCH to shutdown if this profile fails to load, uncomment the next line. -->
     <!-- <param name="shutdown-on-fail" value="true"/> -->
-    <param name="sip-trace" value="no"/>
+    <param name="sip-trace" value="yes"/>
     <param name="sip-capture" value="no"/>
 
     <!-- Use presence_map.conf.xml to convert extension regex to presence protos for routing -->
@@ -82,13 +82,14 @@
     <param name="watchdog-step-timeout" value="30000"/>
     <param name="watchdog-event-timeout" value="30000"/>
 
-    <param name="log-auth-failures" value="false"/>
+    <param name="log-auth-failures" value="true"/>
     <param name="forward-unsolicited-mwi-notify" value="false"/>
 
     <param name="context" value="public"/>
     <param name="rfc2833-pt" value="101"/>
     <!-- port to bind to for sip traffic -->
     <param name="sip-port" value="$${internal_sip_port}"/>
+    <param name="sip-transport" value="udp"/>
     <param name="dialplan" value="XML"/>
     <param name="dtmf-duration" value="2000"/>
     <param name="inbound-codec-prefs" value="$${global_codec_prefs}"/>
@@ -108,7 +109,7 @@
     <!-- extended info parsing -->
     <!-- <param name="extended-info-parsing" value="true"/> -->
 
-    <!--<param name="aggressive-nat-detection" value="true"/>-->
+    <param name="aggressive-nat-detection" value="true"/>
     <!--
         There are known issues (asserts and segfaults) when 100rel is enabled.
         It is not recommended to enable 100rel at this time.
@@ -126,7 +127,7 @@
     -->
     <!--<param name="enable-timer" value="false"/>-->
     <!--<param name="minimum-session-expires" value="120"/>-->
-    <param name="apply-inbound-acl" value="domains"/>
+    <!--<param name="apply-inbound-acl" value="domains"/>-->
     <!--
         This defines your local network, by default we detect your local network
         and create this localnet.auto ACL for this.
@@ -276,12 +277,12 @@
     <!-- Used for when phones respond to a challenged ACK with method INVITE in the hash -->
     <!--<param name="NDLB-broken-auth-hash" value="true"/>-->
     <!-- add a ;received="<ip>:<port>" to the contact when replying to register for nat handling -->
-    <!--<param name="NDLB-received-in-nat-reg-contact" value="true"/>-->
+    <param name="NDLB-received-in-nat-reg-contact" value="true"/>
     <param name="auth-calls" value="$${internal_auth_calls}"/>
     <!-- Force subscription requests to require authentication -->
     <param name="auth-subscriptions" value="true"/>
     <!-- Force the user and auth-user to match. -->
-    <param name="inbound-reg-force-matching-username" value="true"/>
+    <param name="inbound-reg-force-matching-username" value="false"/>
     <!-- on authed calls, authenticate *all* the packets not just invite -->
     <param name="auth-all-packets" value="false"/>
 
@@ -351,7 +352,7 @@
     <!--<param name="enable-3pcc" value="true"/>-->
 
     <!-- use at your own risk or if you know what this does.-->
-    <!--<param name="NDLB-force-rport" value="true"/>-->
+    <param name="NDLB-force-rport" value="true"/>
     <!--
         Choose the realm challenge key. Default is auto_to if not set.
 
@@ -366,7 +367,7 @@
 
         Note: comment out to restore the behavior before 2008-09-29
     -->
-    <param name="challenge-realm" value="auto_from"/>
+    <param name="challenge-realm" value="$${domain}"/>
     <!--<param name="disable-rtp-auto-adjust" value="true"/>-->
     <!-- on inbound calls make the uuid of the session equal to the sip call id of that call -->
     <!--<param name="inbound-use-callid-as-uuid" value="true"/>-->
