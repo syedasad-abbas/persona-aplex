@@ -72,7 +72,7 @@ ENV ESL_PASSWORD=FS!Secure2026
 
 
 # Expose SIP signaling, ESL, and RTP media ports.
-EXPOSE 5060/udp 5060/tcp 5080/udp 5080/tcp 8021/tcp 10000-20000/udp
+EXPOSE 5060/udp 5060/tcp 5090/udp 5090/tcp 5080/udp 5080/tcp 8021/tcp 4000-4100/udp
 ENV PATH="/usr/local/freeswitch/bin:${PATH}"
 
 COPY scripts/freeswitch-entrypoint.sh /usr/local/bin/freeswitch-entrypoint.sh

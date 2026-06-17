@@ -83,6 +83,10 @@ VERIFIED_AI_RESPONSE_TRIGGER_PEAK = int(os.getenv("VERIFIED_AI_RESPONSE_TRIGGER_
 VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
     "VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER", "1"
 ).lower() in ("1", "true", "yes")
+SCRIPTED_INTAKE_FALLBACK_ENABLED = os.getenv("SCRIPTED_INTAKE_FALLBACK_ENABLED", "1").lower() in ("1", "true", "yes")
+SCRIPTED_INTAKE_MIN_ACTIVE_MS = float(os.getenv("SCRIPTED_INTAKE_MIN_ACTIVE_MS", "350"))
+SCRIPTED_INTAKE_END_SILENCE_MS = float(os.getenv("SCRIPTED_INTAKE_END_SILENCE_MS", "900"))
+SCRIPTED_INTAKE_PROMPT_GRACE_MS = float(os.getenv("SCRIPTED_INTAKE_PROMPT_GRACE_MS", "500"))
 
 # mod_audio_stream sends L16 at this rate
 FS_SAMPLE_RATE = 16000
@@ -195,6 +199,13 @@ class CallSession:
         self.verified_response_frames = 0
         self.moshi_audio_suppressed = 0
         self.moshi_text_suppressed = 0
+        self.last_ai_prompt_at = 0.0
+        self.last_ai_prompt_duration_ms = 0.0
+        self.scripted_intake_stage = 0
+        self.scripted_turn_started = False
+        self.scripted_turn_active_ms = 0.0
+        self.scripted_turn_silence_ms = 0.0
+        self.scripted_intake_done = False
 
     @property
     def active(self):
@@ -393,6 +404,9 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     session.verified_response_bytes = len(raw_audio)
     session.verified_response_frames += 1
     session.transcript_tokens.append(response_text)
+    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    session.last_ai_prompt_at = time.time()
+    session.last_ai_prompt_duration_ms = duration_ms
 
     peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
     if not session.first_playback_logged:
@@ -411,7 +425,7 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
         reason,
         response_text,
         len(raw_audio),
-        (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE,
+        duration_ms,
         peak,
     )
     try:
@@ -419,6 +433,123 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
         _maybe_log_audio_stats(session)
     except (ConnectionError, asyncio.CancelledError) as e:
         log.warning("Call %s: Failed sending verified AI response to FreeSWITCH: %s", session.call_uuid, e)
+
+
+def _scripted_intake_text(stage: int) -> str:
+    prompts = (
+        "Thank you. Did I get your name correctly?",
+        "Great. What is your phone number?",
+        "Thank you. I have your phone number. Is that correct?",
+        "Thank you. I have your details. Goodbye.",
+    )
+    if 0 <= stage < len(prompts):
+        return prompts[stage]
+    return ""
+
+
+def _reset_scripted_turn(session: CallSession):
+    session.scripted_turn_started = False
+    session.scripted_turn_active_ms = 0.0
+    session.scripted_turn_silence_ms = 0.0
+
+
+async def _send_scripted_intake_response(ws_fs, session: CallSession, text: str, reason: str):
+    if not text or ws_fs.closed or not session.active:
+        return
+    try:
+        raw_audio = await asyncio.to_thread(_build_verified_response_raw, text)
+    except Exception as e:
+        log.error("Call %s: scripted intake synthesis failed: %s", session.call_uuid, e)
+        return
+    if ws_fs.closed or not session.active:
+        return
+
+    pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    session.ai_pcm_chunks.append(raw_audio)
+    session.ai_probe.add_pcm_float(pcm, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
+    session.playback_frames += 1
+    session.playback_bytes += len(raw_audio)
+    session.transcript_tokens.append(" " + text)
+    session.last_ai_prompt_at = time.time()
+    session.last_ai_prompt_duration_ms = duration_ms
+    if not session.first_playback_logged:
+        session.first_playback_logged = True
+        log.info(
+            "Call %s: First scripted intake playback frame to FreeSWITCH bytes=%d sample_rate=%d peak=%d",
+            session.call_uuid,
+            len(raw_audio),
+            FS_PLAYBACK_SAMPLE_RATE,
+            int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0,
+        )
+    log.info(
+        "Call %s: SCRIPTED_INTAKE_RESPONSE stage=%d reason=%s text=%r bytes=%d duration_ms=%.0f",
+        session.call_uuid,
+        session.scripted_intake_stage,
+        reason,
+        text,
+        len(raw_audio),
+        duration_ms,
+    )
+    try:
+        await _send_stream_audio(ws_fs, session, raw_audio)
+        _maybe_log_audio_stats(session)
+    except (ConnectionError, asyncio.CancelledError) as e:
+        log.warning("Call %s: Failed sending scripted intake response to FreeSWITCH: %s", session.call_uuid, e)
+
+
+async def _maybe_advance_scripted_intake(ws_fs, session: CallSession, pcm, sample_rate: int, reason: str):
+    if (
+        not SCRIPTED_INTAKE_FALLBACK_ENABLED
+        or not session.verified_response_sent
+        or session.scripted_intake_done
+        or ws_fs.closed
+        or not session.active
+    ):
+        return
+    # If Moshi has started producing a real response, let it own the call.
+    if session.moshi_audio_frames or session.moshi_text_frames:
+        return
+    if pcm is None or pcm.size == 0 or sample_rate <= 0:
+        return
+
+    now = time.time()
+    prompt_done_at = session.last_ai_prompt_at + (
+        session.last_ai_prompt_duration_ms + SCRIPTED_INTAKE_PROMPT_GRACE_MS
+    ) / 1000.0
+    if session.last_ai_prompt_at and now < prompt_done_at:
+        return
+
+    duration_ms = (pcm.size * 1000.0) / sample_rate
+    abs_i16 = np.abs(np.clip(pcm, -1.0, 1.0)) * 32767.0
+    peak = int(np.max(abs_i16)) if abs_i16.size else 0
+    active_ms = (int(np.count_nonzero(abs_i16 >= AUDIBLE_ACTIVE_THRESHOLD)) * 1000.0) / sample_rate
+
+    if peak >= AUDIBLE_ACTIVE_THRESHOLD and active_ms > 0:
+        session.scripted_turn_started = True
+        session.scripted_turn_active_ms += active_ms
+        session.scripted_turn_silence_ms = 0.0
+        return
+
+    if not session.scripted_turn_started:
+        return
+
+    session.scripted_turn_silence_ms += duration_ms
+    if (
+        session.scripted_turn_active_ms < SCRIPTED_INTAKE_MIN_ACTIVE_MS
+        or session.scripted_turn_silence_ms < SCRIPTED_INTAKE_END_SILENCE_MS
+    ):
+        return
+
+    text = _scripted_intake_text(session.scripted_intake_stage)
+    if not text:
+        session.scripted_intake_done = True
+        return
+    await _send_scripted_intake_response(ws_fs, session, text, reason)
+    session.scripted_intake_stage += 1
+    if not _scripted_intake_text(session.scripted_intake_stage):
+        session.scripted_intake_done = True
+    _reset_scripted_turn(session)
 
 
 async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
@@ -1093,6 +1224,8 @@ async def _drain_fs_during_handshake(ws_fs, session: CallSession, stop_event: as
             if pcm is not None:
                 _buffer_caller_audio_for_moshi(pcm, sample_rate, session, "pre-ready")
                 _maybe_log_audio_stats(session)
+                await _maybe_send_verified_response(ws_fs, session, "pre_moshi_audio_detected")
+                await _maybe_advance_scripted_intake(ws_fs, session, pcm, sample_rate, "pre_moshi_audio_detected")
     except asyncio.CancelledError:
         pass
     except Exception as e:

@@ -2,11 +2,14 @@ services:
   freeswitch:
     build: ./freeswitch
     environment:
-      - FS_PUBLIC_IP=${FS_PUBLIC_IP:-}
+      - FS_PUBLIC_IP=${FS_PUBLIC_IP:-192.169.46.42}
       - FS_PUBLIC_IP_URL=${FS_PUBLIC_IP_URL:-https://api.ipify.org}
-      - FS_SIP_DOMAIN=${FS_SIP_DOMAIN:-}
+      - FS_SIP_DOMAIN=${FS_SIP_DOMAIN:-192.169.46.42}
     ports:
       - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5090:5060/udp"
+      - "5090:5060/tcp"
       - "5080:5080/udp"
       - "8021:8021/tcp"
       - "4000-4100:4000-4100/udp"
@@ -38,17 +41,21 @@ services:
       - MOSHI_PREWARM_TIMEOUT=1200
       - MOSHI_SKIP_VOICE_PROMPT_STEPS=1
       - MOSHI_BUSY_WAIT_TIMEOUT=1200
-      - MOSHI_SKIP_SYSTEM_PROMPTS=1
+      - MOSHI_SKIP_SYSTEM_PROMPTS=0
       - MOSHI_AUDIO_SILENCE_FRAME_CNT=1
-      - MOSHI_SKIP_SYSTEM_PROMPTS_KEEP_SILENCE=1
+      - MOSHI_SKIP_SYSTEM_PROMPTS_KEEP_SILENCE=0
       - EXPECTED_AI_PHRASE=Alex from HealthFirst Medical Center
       - VERIFIED_AI_RESPONSE_ENABLED=1
       - VERIFIED_AI_RESPONSE_MODE=assist
-      - VERIFIED_AI_RESPONSE_TEXT=Hello, this is Alex from HealthFirst Medical Center. I can help book your appointment. May I have your full name?
+      - VERIFIED_AI_RESPONSE_TEXT=Hello, this is Alex from HealthFirst Medical Center. May I have your full name?
       - VERIFIED_AI_RESPONSE_VOICE=slt
       - VERIFIED_AI_RESPONSE_TRIGGER_ACTIVE_MS=0
       - VERIFIED_AI_RESPONSE_TRIGGER_PEAK=0
       - VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER=0
+      - SCRIPTED_INTAKE_FALLBACK_ENABLED=1
+      - SCRIPTED_INTAKE_MIN_ACTIVE_MS=350
+      - SCRIPTED_INTAKE_END_SILENCE_MS=900
+      - SCRIPTED_INTAKE_PROMPT_GRACE_MS=500
       - AUDIBLE_ACTIVE_THRESHOLD=500
       - AUDIBLE_MIN_ACTIVE_MS=150
       - RELAY_READY_TIMEOUT=120

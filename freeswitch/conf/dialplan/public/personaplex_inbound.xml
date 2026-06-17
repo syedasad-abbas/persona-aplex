@@ -1,6 +1,6 @@
 <include>
   <extension name="personaplex_agent_public_alias">
-    <condition field="destination_number" expression="^(persona_agent|9000)$">
+    <condition field="destination_number" expression="^(persona_agent|9000|1000)$">
       <action application="set" data="personaplex_agent_allowed=true"/>
       <action application="transfer" data="persona_agent XML default"/>
     </condition>
