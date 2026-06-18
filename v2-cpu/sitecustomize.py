@@ -1,9 +1,36 @@
 """Runtime compatibility patches for the CPU container."""
 
+import os
+
 try:
     import torch
 except Exception:
     torch = None
+
+def _env_int(name):
+    try:
+        value = os.getenv(name)
+    except Exception:
+        return None
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+if torch is not None:
+    _cpu_threads = _env_int("MOSHI_CPU_THREADS") or _env_int("TORCH_NUM_THREADS")
+    _interop_threads = _env_int("MOSHI_CPU_INTEROP_THREADS")
+    if _cpu_threads:
+        torch.set_num_threads(_cpu_threads)
+    if _interop_threads:
+        try:
+            torch.set_num_interop_threads(_interop_threads)
+        except RuntimeError:
+            pass
 
 if torch is not None and not torch.cuda.is_available():
     _torch_load = torch.load
@@ -19,7 +46,6 @@ if torch is not None and not torch.cuda.is_available():
 # embeddings before it sends the websocket handshake. For telephony we need a
 # live session quickly; these env-gated patches keep the behavior reversible.
 try:
-    import os
     from moshi.models import lm as _moshi_lm
 except Exception:
     _moshi_lm = None

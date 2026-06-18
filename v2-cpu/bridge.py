@@ -56,7 +56,17 @@ OUTBOUND_TEST_TONE_CALLER = os.getenv("OUTBOUND_TEST_TONE_CALLER", "")
 MOSHI_HANDSHAKE_TIMEOUT = float(os.getenv("MOSHI_HANDSHAKE_TIMEOUT", "90"))
 MOSHI_PREWARM = os.getenv("MOSHI_PREWARM", "1").lower() in ("1", "true", "yes")
 MOSHI_PREWARM_TIMEOUT = float(os.getenv("MOSHI_PREWARM_TIMEOUT", "180"))
-MOSHI_BUSY_WAIT_TIMEOUT = float(os.getenv("MOSHI_BUSY_WAIT_TIMEOUT", str(MOSHI_PREWARM_TIMEOUT)))
+# This bounds how long a live caller sits in silence waiting for a prewarmed
+# PersonaPlex session before we fall back to the verified-response relay (or
+# give up). It must be short enough that a real caller won't hang up first —
+# defaulting it to MOSHI_PREWARM_TIMEOUT (background prewarm budget, up to
+# 180s) left callers waiting far too long. Default to a much tighter ceiling;
+# override via env if your deployment truly needs longer.
+MOSHI_BUSY_WAIT_TIMEOUT = float(os.getenv("MOSHI_BUSY_WAIT_TIMEOUT", "12"))
+# A prewarmed PersonaPlex websocket can go stale (model session degraded/idle)
+# the longer it sits unused in the queue. Discard anything older than this
+# at checkout time rather than handing a dead session to a live call.
+MOSHI_PREWARM_MAX_AGE = float(os.getenv("MOSHI_PREWARM_MAX_AGE", "60"))
 INBOUND_GAIN = float(os.getenv("INBOUND_GAIN", "1.0"))
 OUTBOUND_GAIN = float(os.getenv("OUTBOUND_GAIN", "1.0"))
 AUDIO_STATS_INTERVAL = float(os.getenv("AUDIO_STATS_INTERVAL", "5"))
@@ -83,10 +93,6 @@ VERIFIED_AI_RESPONSE_TRIGGER_PEAK = int(os.getenv("VERIFIED_AI_RESPONSE_TRIGGER_
 VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
     "VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER", "1"
 ).lower() in ("1", "true", "yes")
-SCRIPTED_INTAKE_FALLBACK_ENABLED = os.getenv("SCRIPTED_INTAKE_FALLBACK_ENABLED", "1").lower() in ("1", "true", "yes")
-SCRIPTED_INTAKE_MIN_ACTIVE_MS = float(os.getenv("SCRIPTED_INTAKE_MIN_ACTIVE_MS", "350"))
-SCRIPTED_INTAKE_END_SILENCE_MS = float(os.getenv("SCRIPTED_INTAKE_END_SILENCE_MS", "900"))
-SCRIPTED_INTAKE_PROMPT_GRACE_MS = float(os.getenv("SCRIPTED_INTAKE_PROMPT_GRACE_MS", "500"))
 
 # mod_audio_stream sends L16 at this rate
 FS_SAMPLE_RATE = 16000
@@ -199,13 +205,6 @@ class CallSession:
         self.verified_response_frames = 0
         self.moshi_audio_suppressed = 0
         self.moshi_text_suppressed = 0
-        self.last_ai_prompt_at = 0.0
-        self.last_ai_prompt_duration_ms = 0.0
-        self.scripted_intake_stage = 0
-        self.scripted_turn_started = False
-        self.scripted_turn_active_ms = 0.0
-        self.scripted_turn_silence_ms = 0.0
-        self.scripted_intake_done = False
 
     @property
     def active(self):
@@ -235,11 +234,42 @@ class PreparedMoshiSession:
         self.ws_moshi = ws_moshi
         self.created_at = created_at
 
+    @property
+    def age(self) -> float:
+        return time.time() - self.created_at
+
+    @property
+    def stale(self) -> bool:
+        return self.age > MOSHI_PREWARM_MAX_AGE
+
     async def close(self):
         with contextlib.suppress(Exception):
             await self.ws_moshi.close()
         with contextlib.suppress(Exception):
             await self.http_session.close()
+
+
+async def _checkout_prepared_session(queue: asyncio.Queue, call_uuid: str) -> Optional["PreparedMoshiSession"]:
+    """Pull a prewarmed session from the queue, discarding it (and trying the
+    next one) if it has gone stale rather than handing a dead session to a
+    live call. Returns None if the queue is empty or only stale sessions
+    were available.
+    """
+    while True:
+        try:
+            prepared = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        if prepared.stale:
+            log.warning(
+                "Call %s: Discarding stale prewarmed PersonaPlex session age=%.2fs (max=%.1fs)",
+                call_uuid,
+                prepared.age,
+                MOSHI_PREWARM_MAX_AGE,
+            )
+            await prepared.close()
+            continue
+        return prepared
 
 
 def _stream_audio_message(raw_audio: bytes, sample_rate: int = FS_PLAYBACK_SAMPLE_RATE):
@@ -405,8 +435,6 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     session.verified_response_frames += 1
     session.transcript_tokens.append(response_text)
     duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
-    session.last_ai_prompt_at = time.time()
-    session.last_ai_prompt_duration_ms = duration_ms
 
     peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
     if not session.first_playback_logged:
@@ -433,123 +461,6 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
         _maybe_log_audio_stats(session)
     except (ConnectionError, asyncio.CancelledError) as e:
         log.warning("Call %s: Failed sending verified AI response to FreeSWITCH: %s", session.call_uuid, e)
-
-
-def _scripted_intake_text(stage: int) -> str:
-    prompts = (
-        "Thank you. Did I get your name correctly?",
-        "Great. What is your phone number?",
-        "Thank you. I have your phone number. Is that correct?",
-        "Thank you. I have your details. Goodbye.",
-    )
-    if 0 <= stage < len(prompts):
-        return prompts[stage]
-    return ""
-
-
-def _reset_scripted_turn(session: CallSession):
-    session.scripted_turn_started = False
-    session.scripted_turn_active_ms = 0.0
-    session.scripted_turn_silence_ms = 0.0
-
-
-async def _send_scripted_intake_response(ws_fs, session: CallSession, text: str, reason: str):
-    if not text or ws_fs.closed or not session.active:
-        return
-    try:
-        raw_audio = await asyncio.to_thread(_build_verified_response_raw, text)
-    except Exception as e:
-        log.error("Call %s: scripted intake synthesis failed: %s", session.call_uuid, e)
-        return
-    if ws_fs.closed or not session.active:
-        return
-
-    pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
-    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
-    session.ai_pcm_chunks.append(raw_audio)
-    session.ai_probe.add_pcm_float(pcm, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
-    session.playback_frames += 1
-    session.playback_bytes += len(raw_audio)
-    session.transcript_tokens.append(" " + text)
-    session.last_ai_prompt_at = time.time()
-    session.last_ai_prompt_duration_ms = duration_ms
-    if not session.first_playback_logged:
-        session.first_playback_logged = True
-        log.info(
-            "Call %s: First scripted intake playback frame to FreeSWITCH bytes=%d sample_rate=%d peak=%d",
-            session.call_uuid,
-            len(raw_audio),
-            FS_PLAYBACK_SAMPLE_RATE,
-            int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0,
-        )
-    log.info(
-        "Call %s: SCRIPTED_INTAKE_RESPONSE stage=%d reason=%s text=%r bytes=%d duration_ms=%.0f",
-        session.call_uuid,
-        session.scripted_intake_stage,
-        reason,
-        text,
-        len(raw_audio),
-        duration_ms,
-    )
-    try:
-        await _send_stream_audio(ws_fs, session, raw_audio)
-        _maybe_log_audio_stats(session)
-    except (ConnectionError, asyncio.CancelledError) as e:
-        log.warning("Call %s: Failed sending scripted intake response to FreeSWITCH: %s", session.call_uuid, e)
-
-
-async def _maybe_advance_scripted_intake(ws_fs, session: CallSession, pcm, sample_rate: int, reason: str):
-    if (
-        not SCRIPTED_INTAKE_FALLBACK_ENABLED
-        or not session.verified_response_sent
-        or session.scripted_intake_done
-        or ws_fs.closed
-        or not session.active
-    ):
-        return
-    # If Moshi has started producing a real response, let it own the call.
-    if session.moshi_audio_frames or session.moshi_text_frames:
-        return
-    if pcm is None or pcm.size == 0 or sample_rate <= 0:
-        return
-
-    now = time.time()
-    prompt_done_at = session.last_ai_prompt_at + (
-        session.last_ai_prompt_duration_ms + SCRIPTED_INTAKE_PROMPT_GRACE_MS
-    ) / 1000.0
-    if session.last_ai_prompt_at and now < prompt_done_at:
-        return
-
-    duration_ms = (pcm.size * 1000.0) / sample_rate
-    abs_i16 = np.abs(np.clip(pcm, -1.0, 1.0)) * 32767.0
-    peak = int(np.max(abs_i16)) if abs_i16.size else 0
-    active_ms = (int(np.count_nonzero(abs_i16 >= AUDIBLE_ACTIVE_THRESHOLD)) * 1000.0) / sample_rate
-
-    if peak >= AUDIBLE_ACTIVE_THRESHOLD and active_ms > 0:
-        session.scripted_turn_started = True
-        session.scripted_turn_active_ms += active_ms
-        session.scripted_turn_silence_ms = 0.0
-        return
-
-    if not session.scripted_turn_started:
-        return
-
-    session.scripted_turn_silence_ms += duration_ms
-    if (
-        session.scripted_turn_active_ms < SCRIPTED_INTAKE_MIN_ACTIVE_MS
-        or session.scripted_turn_silence_ms < SCRIPTED_INTAKE_END_SILENCE_MS
-    ):
-        return
-
-    text = _scripted_intake_text(session.scripted_intake_stage)
-    if not text:
-        session.scripted_intake_done = True
-        return
-    await _send_scripted_intake_response(ws_fs, session, text, reason)
-    session.scripted_intake_stage += 1
-    if not _scripted_intake_text(session.scripted_intake_stage):
-        session.scripted_intake_done = True
-    _reset_scripted_turn(session)
 
 
 async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
@@ -806,8 +717,28 @@ async def _prewarm_moshi_loop(app, domain_config):
     while True:
         try:
             if queue.full():
-                await asyncio.sleep(1)
-                continue
+                # Don't let a prewarmed session sit unused indefinitely.
+                # Peek at it; if it's gone stale, evict and replace it so a
+                # live call never gets handed a dead PersonaPlex session.
+                stale_to_close = None
+                try:
+                    queued = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    queued = None
+                if queued is not None:
+                    if queued.stale:
+                        stale_to_close = queued
+                    else:
+                        queue.put_nowait(queued)
+                if stale_to_close is None:
+                    await asyncio.sleep(1)
+                    continue
+                log.warning(
+                    "background-prewarm: Evicting stale queued PersonaPlex session age=%.2fs (max=%.1fs)",
+                    stale_to_close.age,
+                    MOSHI_PREWARM_MAX_AGE,
+                )
+                await stale_to_close.close()
             async with moshi_lock:
                 if queue.full():
                     continue
@@ -868,6 +799,7 @@ async def start_relay_server(domain_config):
     log.info(
         "Audio relay config fs_sample_rate=%d fs_playback_rate=%d moshi_sample_rate=%d "
         "inbound_gain=%.2f outbound_gain=%.2f handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
+        "prewarm_max_age=%.1fs "
         "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s "
         "audible_threshold=%d audible_min_ms=%.0f expected_ai_phrase=%r system_prompts_skipped=%s "
         "verified_response=%s verified_mode=%s verified_voice=%s verified_trigger_active_ms=%.0f",
@@ -879,6 +811,7 @@ async def start_relay_server(domain_config):
         MOSHI_HANDSHAKE_TIMEOUT,
         MOSHI_PREWARM,
         MOSHI_PREWARM_TIMEOUT,
+        MOSHI_PREWARM_MAX_AGE,
         OUTBOUND_TEST_TONE,
         OUTBOUND_TEST_TONE_DELAY,
         OUTBOUND_TEST_TONE_DURATION_MS,
@@ -971,10 +904,7 @@ async def _handle_audio_ws(request):
         queue: asyncio.Queue = request.app["moshi_ready_sessions"]
         prepared: Optional[PreparedMoshiSession] = None
 
-        try:
-            prepared = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            prepared = None
+        prepared = await _checkout_prepared_session(queue, call_uuid)
         log.info(
             "Call %s: PersonaPlex session checkout queue_size=%d lock=%s prepared=%s",
             call_uuid,
@@ -995,7 +925,7 @@ async def _handle_audio_ws(request):
                 log.info(
                     "Call %s: Received prewarmed PersonaPlex session after busy wait age=%.2fs buffered_opus=%d",
                     call_uuid,
-                    time.time() - prepared.created_at,
+                    prepared.age,
                     len(session.pending_opus_frames),
                 )
             except asyncio.TimeoutError:
@@ -1033,10 +963,7 @@ async def _handle_audio_ws(request):
 
             try:
                 if prepared is None:
-                    try:
-                        prepared = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        prepared = None
+                    prepared = await _checkout_prepared_session(queue, call_uuid)
 
                 if prepared is not None:
                     ws_moshi = prepared.ws_moshi
@@ -1044,7 +971,7 @@ async def _handle_audio_ws(request):
                     log.info(
                         "Call %s: Using prewarmed PersonaPlex websocket age=%.2fs queued_ready=%d",
                         call_uuid,
-                        time.time() - prepared.created_at,
+                        prepared.age,
                         queue.qsize(),
                     )
                     if not await _flush_pending_opus_to_moshi(ws_moshi, session, "prewarmed_session"):
@@ -1164,9 +1091,19 @@ async def _wait_for_prepared_moshi_session(queue: asyncio.Queue, ws_fs, session:
         if remaining <= 0:
             raise asyncio.TimeoutError
         try:
-            return await asyncio.wait_for(queue.get(), timeout=min(1.0, remaining))
+            prepared = await asyncio.wait_for(queue.get(), timeout=min(1.0, remaining))
         except asyncio.TimeoutError:
             continue
+        if prepared.stale:
+            log.warning(
+                "Call %s: Discarding stale PersonaPlex session age=%.2fs received during busy wait (max=%.1fs)",
+                session.call_uuid,
+                prepared.age,
+                MOSHI_PREWARM_MAX_AGE,
+            )
+            await prepared.close()
+            continue
+        return prepared
     raise ConnectionError("call ended while waiting for PersonaPlex prewarm")
 
 
@@ -1224,8 +1161,6 @@ async def _drain_fs_during_handshake(ws_fs, session: CallSession, stop_event: as
             if pcm is not None:
                 _buffer_caller_audio_for_moshi(pcm, sample_rate, session, "pre-ready")
                 _maybe_log_audio_stats(session)
-                await _maybe_send_verified_response(ws_fs, session, "pre_moshi_audio_detected")
-                await _maybe_advance_scripted_intake(ws_fs, session, pcm, sample_rate, "pre_moshi_audio_detected")
     except asyncio.CancelledError:
         pass
     except Exception as e:
