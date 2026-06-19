@@ -76,6 +76,8 @@ FS_ESL_PASSWORD = os.getenv("FS_ESL_PASSWORD", "FS!Secure2026")
 FS_TEMP_DIR = os.getenv("FS_TEMP_DIR", "/tmp")
 FS_PLAYBACK_BROADCAST_FALLBACK = os.getenv("FS_PLAYBACK_BROADCAST_FALLBACK", "1").lower() in ("1", "true", "yes")
 FS_PLAYBACK_BROADCAST_DELAY = float(os.getenv("FS_PLAYBACK_BROADCAST_DELAY", "0.25"))
+FS_PLAYBACK_BROADCAST_BATCH_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_BATCH_MS", "640"))
+FS_PLAYBACK_BROADCAST_MAX_DELAY_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_MAX_DELAY_MS", "320"))
 AUDIBLE_ACTIVE_THRESHOLD = int(os.getenv("AUDIBLE_ACTIVE_THRESHOLD", "500"))
 AUDIBLE_MIN_ACTIVE_MS = float(os.getenv("AUDIBLE_MIN_ACTIVE_MS", "250"))
 EXPECTED_AI_PHRASE = os.getenv("EXPECTED_AI_PHRASE", "thank you").strip()
@@ -98,6 +100,10 @@ VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
 FS_SAMPLE_RATE = 16000
 # Match the uuid_audio_stream sample rate unless explicitly overridden.
 FS_PLAYBACK_SAMPLE_RATE = int(os.getenv("FS_PLAYBACK_SAMPLE_RATE", str(FS_SAMPLE_RATE)))
+FS_PLAYBACK_BROADCAST_BATCH_BYTES = max(
+    3200,
+    int(FS_PLAYBACK_SAMPLE_RATE * 2 * FS_PLAYBACK_BROADCAST_BATCH_MS / 1000),
+)
 # PersonaPlex operates at 24kHz.
 MOSHI_SAMPLE_RATE = 24000
 
@@ -190,6 +196,9 @@ class CallSession:
         self.first_playback_logged = False
         self.stream_audio_messages = 0
         self.stream_audio_bytes = 0
+        self.stream_audio_batch = bytearray()
+        self.stream_audio_batch_task = None
+        self.stream_audio_batch_lock = asyncio.Lock()
         self.fs_play_events = 0
         self.last_play_event_file = ""
         self.ai_pcm_chunks: List[bytes] = []
@@ -322,13 +331,66 @@ async def _broadcast_stream_audio_file_later(session: CallSession, stream_index:
         log.warning("Call %s: fallback uuid_broadcast failed for %s: %s", session.call_uuid, file_path, e)
 
 
-async def _send_stream_audio(ws_fs, session: CallSession, raw_audio: bytes):
+async def _send_stream_audio_now(ws_fs, session: CallSession, raw_audio: bytes, reason: str = "immediate"):
     stream_index = session.stream_audio_messages
     session.stream_audio_messages += 1
     await ws_fs.send_str(json.dumps(_stream_audio_message(raw_audio)))
     session.stream_audio_bytes += len(raw_audio)
+    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    log.info(
+        "Call %s: Sent playback chunk index=%d reason=%s bytes=%d duration_ms=%.0f fallback=%s",
+        session.call_uuid,
+        stream_index,
+        reason,
+        len(raw_audio),
+        duration_ms,
+        FS_PLAYBACK_BROADCAST_FALLBACK,
+    )
     if FS_PLAYBACK_BROADCAST_FALLBACK:
         asyncio.create_task(_broadcast_stream_audio_file_later(session, stream_index))
+
+
+async def _flush_stream_audio_batch(ws_fs, session: CallSession, reason: str):
+    async with session.stream_audio_batch_lock:
+        if not session.stream_audio_batch:
+            return
+        raw_audio = bytes(session.stream_audio_batch)
+        session.stream_audio_batch.clear()
+
+    await _send_stream_audio_now(ws_fs, session, raw_audio, reason)
+
+
+async def _flush_stream_audio_batch_later(ws_fs, session: CallSession):
+    try:
+        await asyncio.sleep(FS_PLAYBACK_BROADCAST_MAX_DELAY_MS / 1000.0)
+        if session.active and not ws_fs.closed:
+            await _flush_stream_audio_batch(ws_fs, session, "batch_timer")
+    except asyncio.CancelledError:
+        pass
+
+
+async def _send_stream_audio(ws_fs, session: CallSession, raw_audio: bytes):
+    if not FS_PLAYBACK_BROADCAST_FALLBACK:
+        await _send_stream_audio_now(ws_fs, session, raw_audio, "direct")
+        return
+
+    should_flush = False
+    async with session.stream_audio_batch_lock:
+        session.stream_audio_batch.extend(raw_audio)
+
+        if len(session.stream_audio_batch) >= FS_PLAYBACK_BROADCAST_BATCH_BYTES:
+            should_flush = True
+            task = session.stream_audio_batch_task
+            if task is not None and not task.done():
+                task.cancel()
+            session.stream_audio_batch_task = None
+        elif session.stream_audio_batch_task is None or session.stream_audio_batch_task.done():
+            session.stream_audio_batch_task = asyncio.create_task(
+                _flush_stream_audio_batch_later(ws_fs, session)
+            )
+
+    if should_flush:
+        await _flush_stream_audio_batch(ws_fs, session, "batch_full")
 
 
 _verified_response_cache: dict[tuple[str, str, int], bytes] = {}
@@ -800,6 +862,7 @@ async def start_relay_server(domain_config):
         "Audio relay config fs_sample_rate=%d fs_playback_rate=%d moshi_sample_rate=%d "
         "inbound_gain=%.2f outbound_gain=%.2f handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
         "prewarm_max_age=%.1fs "
+        "playback_fallback=%s fallback_batch_ms=%.0f fallback_batch_bytes=%d fallback_max_delay_ms=%.0f "
         "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s "
         "audible_threshold=%d audible_min_ms=%.0f expected_ai_phrase=%r system_prompts_skipped=%s "
         "verified_response=%s verified_mode=%s verified_voice=%s verified_trigger_active_ms=%.0f",
@@ -812,6 +875,10 @@ async def start_relay_server(domain_config):
         MOSHI_PREWARM,
         MOSHI_PREWARM_TIMEOUT,
         MOSHI_PREWARM_MAX_AGE,
+        FS_PLAYBACK_BROADCAST_FALLBACK,
+        FS_PLAYBACK_BROADCAST_BATCH_MS,
+        FS_PLAYBACK_BROADCAST_BATCH_BYTES,
+        FS_PLAYBACK_BROADCAST_MAX_DELAY_MS,
         OUTBOUND_TEST_TONE,
         OUTBOUND_TEST_TONE_DELAY,
         OUTBOUND_TEST_TONE_DURATION_MS,
@@ -1393,6 +1460,13 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
     except Exception as e:
         log.error("Call %s: Moshi->FS relay error: %s", session.call_uuid, e)
     finally:
+        if FS_PLAYBACK_BROADCAST_FALLBACK:
+            task = session.stream_audio_batch_task
+            if task is not None and not task.done():
+                task.cancel()
+            if not ws_fs.closed:
+                with contextlib.suppress(Exception):
+                    await _flush_stream_audio_batch(ws_fs, session, "relay_end")
         session.stop()
 
 
