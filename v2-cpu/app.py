@@ -147,13 +147,7 @@ def _esl_event_loop(domain_config):
                                         file_path = ""
                                 if file_path:
                                     mark_play_event(uuid, file_path)
-                                    play_esl = ESLClient(FS_ESL_HOST, FS_ESL_PORT, FS_ESL_PASSWORD)
-                                    try:
-                                        play_esl.connect()
-                                        play_result = play_esl.api("uuid_broadcast", f"{uuid} {file_path} aleg")
-                                        log.info("Call %s: uuid_broadcast %s -> %s", uuid, file_path, play_result.strip()[:200])
-                                    finally:
-                                        play_esl.close()
+                                    log.info("Call %s: streamAudio play event observed; uuid_broadcast fallback disabled", uuid)
                         continue
 
                     if name in ("CHANNEL_ANSWER", "CHANNEL_PARK") and uuid and uuid not in stream_started:
@@ -274,7 +268,7 @@ def run_server():
     log.info("PersonaPlex ready")
 
     # 2. Start audio relay server (async)
-    from bridge import start_relay_server
+    from bridge import start_relay_server, wait_for_moshi_prewarm_ready
     relay_loop = asyncio.new_event_loop()
     relay_runner = {"runner": None}
     relay_ready = threading.Event()
@@ -319,6 +313,37 @@ def run_server():
         with contextlib.suppress(Exception):
             moshi_proc.terminate()
         sys.exit(1)
+
+    require_prewarm_ready = os.getenv("REQUIRE_MOSHI_PREWARM_READY", "1").lower() in ("1", "true", "yes")
+    moshi_prewarm_enabled = os.getenv("MOSHI_PREWARM", "1").lower() in ("1", "true", "yes")
+    if require_prewarm_ready and moshi_prewarm_enabled:
+        prewarm_ready_timeout = float(
+            os.getenv(
+                "MOSHI_INITIAL_PREWARM_READY_TIMEOUT",
+                os.getenv("MOSHI_PREWARM_TIMEOUT", "1800"),
+            )
+        )
+        log.info(
+            "Waiting for initial real PersonaPlex prewarm before accepting calls timeout=%.1fs",
+            prewarm_ready_timeout,
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            wait_for_moshi_prewarm_ready(relay_runner["runner"], prewarm_ready_timeout),
+            relay_loop,
+        )
+        try:
+            prewarm_ready = future.result(timeout=prewarm_ready_timeout + 5)
+        except Exception as e:
+            log.error("Initial PersonaPlex prewarm wait failed: %s", e)
+            prewarm_ready = False
+        if not prewarm_ready:
+            log.error("PersonaPlex prewarm is required but no real ready session was queued; exiting")
+            with contextlib.suppress(Exception):
+                moshi_proc.terminate()
+            if relay_loop.is_running():
+                relay_loop.call_soon_threadsafe(relay_loop.stop)
+                relay_thread.join(timeout=5)
+            sys.exit(1)
 
     # 3. Watch for moshi process death
     def _watch_moshi():

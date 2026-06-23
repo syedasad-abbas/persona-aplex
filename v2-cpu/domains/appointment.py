@@ -11,7 +11,5 @@ DEFAULT_VOICE_PROMPT = "NATF2.pt"
 # Keep this prompt compact: PersonaPlex replays one model step per text token
 # before the websocket becomes ready, and CPU prewarm is very sensitive to length.
 TEXT_PROMPT = """
-You are Alex. Speak briefly.
-First say: "Hello, may I have your full name?"
-Then confirm the name, ask for the phone number, repeat the number, confirm it, thank the caller, and end.
+Alex from HealthFirst. Ask name, then phone. Repeat each. Brief.
 """

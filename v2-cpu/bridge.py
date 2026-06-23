@@ -69,15 +69,16 @@ MOSHI_BUSY_WAIT_TIMEOUT = float(os.getenv("MOSHI_BUSY_WAIT_TIMEOUT", "12"))
 MOSHI_PREWARM_MAX_AGE = float(os.getenv("MOSHI_PREWARM_MAX_AGE", "60"))
 INBOUND_GAIN = float(os.getenv("INBOUND_GAIN", "1.0"))
 OUTBOUND_GAIN = float(os.getenv("OUTBOUND_GAIN", "1.0"))
+OUTBOUND_LIMIT_PEAK = float(os.getenv("OUTBOUND_LIMIT_PEAK", "0.92"))
 AUDIO_STATS_INTERVAL = float(os.getenv("AUDIO_STATS_INTERVAL", "5"))
 FS_ESL_HOST = os.getenv("FS_ESL_HOST", "127.0.0.1")
 FS_ESL_PORT = int(os.getenv("FS_ESL_PORT", "8021"))
 FS_ESL_PASSWORD = os.getenv("FS_ESL_PASSWORD", "FS!Secure2026")
 FS_TEMP_DIR = os.getenv("FS_TEMP_DIR", "/tmp")
-FS_PLAYBACK_BROADCAST_FALLBACK = os.getenv("FS_PLAYBACK_BROADCAST_FALLBACK", "1").lower() in ("1", "true", "yes")
-FS_PLAYBACK_BROADCAST_DELAY = float(os.getenv("FS_PLAYBACK_BROADCAST_DELAY", "0.25"))
-FS_PLAYBACK_BROADCAST_BATCH_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_BATCH_MS", "640"))
-FS_PLAYBACK_BROADCAST_MAX_DELAY_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_MAX_DELAY_MS", "320"))
+FS_PLAYBACK_BROADCAST_FALLBACK = os.getenv("FS_PLAYBACK_BROADCAST_FALLBACK", "0").lower() in ("1", "true", "yes")
+FS_PLAYBACK_BROADCAST_DELAY = float(os.getenv("FS_PLAYBACK_BROADCAST_DELAY", "0.10"))
+FS_PLAYBACK_BROADCAST_BATCH_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_BATCH_MS", "480"))
+FS_PLAYBACK_BROADCAST_MAX_DELAY_MS = float(os.getenv("FS_PLAYBACK_BROADCAST_MAX_DELAY_MS", "8000"))
 AUDIBLE_ACTIVE_THRESHOLD = int(os.getenv("AUDIBLE_ACTIVE_THRESHOLD", "500"))
 AUDIBLE_MIN_ACTIVE_MS = float(os.getenv("AUDIBLE_MIN_ACTIVE_MS", "250"))
 EXPECTED_AI_PHRASE = os.getenv("EXPECTED_AI_PHRASE", "thank you").strip()
@@ -726,6 +727,18 @@ def _apply_gain(pcm, gain: float):
     return np.clip(pcm * gain, -1.0, 1.0).astype(np.float32)
 
 
+def _apply_outbound_gain(pcm):
+    if pcm.size == 0:
+        return pcm.astype(np.float32)
+    boosted = (pcm.astype(np.float32) * OUTBOUND_GAIN).astype(np.float32)
+    if OUTBOUND_LIMIT_PEAK <= 0:
+        return np.clip(boosted, -1.0, 1.0).astype(np.float32)
+    peak = float(np.max(np.abs(boosted)))
+    if peak > OUTBOUND_LIMIT_PEAK:
+        boosted *= OUTBOUND_LIMIT_PEAK / peak
+    return boosted.astype(np.float32)
+
+
 
 def _moshi_url_and_params(domain_config):
     voice_prompt = os.getenv("VOICE_PROMPT", domain_config.DEFAULT_VOICE_PROMPT)
@@ -827,6 +840,43 @@ async def _cleanup_moshi_prewarm(app):
             await prepared.close()
 
 
+async def wait_for_moshi_prewarm_ready(runner, timeout: float) -> bool:
+    """Wait until a real prewarmed PersonaPlex session is queued for calls."""
+    app = getattr(runner, "app", None)
+    if app is None:
+        raise RuntimeError("relay runner has no aiohttp app")
+    if not MOSHI_PREWARM:
+        return True
+
+    queue: asyncio.Queue = app["moshi_ready_sessions"]
+    deadline = time.time() + timeout
+    last_log = 0.0
+    while True:
+        if not queue.empty():
+            log.info("Initial PersonaPlex prewarm ready queued_sessions=%d", queue.qsize())
+            return True
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            log.error("Initial PersonaPlex prewarm did not become ready within %.1fs", timeout)
+            return False
+
+        now = time.time()
+        if now - last_log >= 30:
+            last_log = now
+            task = app.get("moshi_prewarm_task")
+            task_state = "missing"
+            if task is not None:
+                task_state = "done" if task.done() else "running"
+            log.info(
+                "Waiting for initial PersonaPlex prewarm queued_sessions=%d task=%s remaining=%.0fs",
+                queue.qsize(),
+                task_state,
+                remaining,
+            )
+
+        await asyncio.sleep(min(1.0, remaining))
+
 
 async def start_relay_server(domain_config):
     """
@@ -860,7 +910,8 @@ async def start_relay_server(domain_config):
     log.info("Audio relay WebSocket server listening on ws://%s:%d/audio", RELAY_BIND_HOST, RELAY_PORT)
     log.info(
         "Audio relay config fs_sample_rate=%d fs_playback_rate=%d moshi_sample_rate=%d "
-        "inbound_gain=%.2f outbound_gain=%.2f handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
+        "inbound_gain=%.2f outbound_gain=%.2f outbound_limit_peak=%.2f "
+        "handshake_timeout=%.1fs prewarm=%s prewarm_timeout=%.1fs "
         "prewarm_max_age=%.1fs "
         "playback_fallback=%s fallback_batch_ms=%.0f fallback_batch_bytes=%d fallback_max_delay_ms=%.0f "
         "test_tone=%s test_tone_delay=%.2fs test_tone_duration_ms=%d test_tone_caller=%s "
@@ -871,6 +922,7 @@ async def start_relay_server(domain_config):
         MOSHI_SAMPLE_RATE,
         INBOUND_GAIN,
         OUTBOUND_GAIN,
+        OUTBOUND_LIMIT_PEAK,
         MOSHI_HANDSHAKE_TIMEOUT,
         MOSHI_PREWARM,
         MOSHI_PREWARM_TIMEOUT,
@@ -1416,7 +1468,7 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                     if pcm_24k.shape[-1] > 0:
                         # Resample 24kHz -> FreeSWITCH playback rate.
                         pcm_fs = _resample_linear(pcm_24k, MOSHI_SAMPLE_RATE, FS_PLAYBACK_SAMPLE_RATE)
-                        pcm_fs = _apply_gain(pcm_fs, OUTBOUND_GAIN)
+                        pcm_fs = _apply_outbound_gain(pcm_fs)
                         # Convert to L16 (16-bit signed LE) for mod_audio_stream streamAudio.
                         l16 = (np.clip(pcm_fs, -1.0, 1.0) * 32767).astype(np.int16)
                         raw_audio = l16.tobytes()
