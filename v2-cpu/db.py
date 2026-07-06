@@ -1,13 +1,14 @@
 """Database operations for the personaplex voice agent."""
 
 import os
-import logging
 
 import pymysql
 from dotenv import load_dotenv
 
+from logging_config import get_logger
+
 load_dotenv()
-log = logging.getLogger("agent.db")
+log = get_logger("agent.db")
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))

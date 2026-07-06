@@ -8,13 +8,14 @@ and receiving events.
 
 import os
 import socket
-import logging
 import time
 import urllib.parse
 import threading
 from typing import Dict, Optional, Callable
 
-log = logging.getLogger("agent.esl")
+from logging_config import get_logger
+
+log = get_logger("agent.esl")
 
 
 class ESLEvent:
@@ -135,12 +136,12 @@ class ESLClient:
             if event:
                 yield event
         except Exception:
-            pass
+            log.debug("ESL read_events failed", exc_info=True)
         finally:
             try:
                 self.sock.settimeout(old_timeout)
             except OSError:
-                pass
+                log.debug("Failed to restore ESL socket timeout", exc_info=True)
 
     def close(self):
         self.connected = False
@@ -148,7 +149,7 @@ class ESLClient:
             try:
                 self.sock.close()
             except Exception:
-                pass
+                log.debug("Failed to close ESL socket", exc_info=True)
 
     # ---- low-level ----
 

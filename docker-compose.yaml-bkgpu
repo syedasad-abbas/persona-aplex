@@ -37,6 +37,7 @@ services:
       - NUMEXPR_NUM_THREADS=1
 
       # PersonaPlex
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VOICE_PROMPT=NATF2.pt
       - AGENT_DOMAIN=appointment
 

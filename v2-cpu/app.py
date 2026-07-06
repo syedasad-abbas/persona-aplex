@@ -12,7 +12,6 @@ Launches:
 import os
 import sys
 import signal
-import logging
 import subprocess
 import time
 import asyncio
@@ -21,14 +20,12 @@ import contextlib
 import json
 
 from dotenv import load_dotenv
+from logging_config import configure_logging, get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-log = logging.getLogger("agent")
+configure_logging()
+log = get_logger("app")
 
 MOSHI_DEVICE = os.getenv("MOSHI_DEVICE", "cpu")
 MOSHI_HOST = os.getenv("MOSHI_HOST", "0.0.0.0")
@@ -78,7 +75,7 @@ def _stream_logs(proc):
             if line:
                 log.info("[moshi] %s", line)
     except Exception:
-        pass
+        log.debug("Moshi log stream ended unexpectedly", exc_info=True)
 
 
 def _wait_for_moshi(timeout=600):
@@ -132,7 +129,7 @@ def _esl_event_loop(domain_config):
                     if name == "CUSTOM":
                         subclass = event.get("Event-Subclass", "")
                         if subclass.startswith("mod_audio_stream::"):
-                            log.info("FreeSWITCH %s uuid=%s body=%s", subclass, uuid or "unknown", event.body[:500])
+                            log.debug("FreeSWITCH %s uuid=%s body=%s", subclass, uuid or "unknown", event.body[:500])
 
                             if subclass == "mod_audio_stream::play" and uuid:
                                 file_path = event.get("file", "") or event.get("File", "")
@@ -198,8 +195,8 @@ def _esl_event_loop(domain_config):
                                     uuid, caller, called,
                                     domain_config.DOMAIN_NAME, voice_prompt, text_prompt,
                                 )
-                            except Exception as e:
-                                log.error("Call %s: DB create failed: %s", uuid, e)
+                            except Exception:
+                                log.warning("Call %s: DB create failed", uuid, exc_info=True)
 
                             # Register session for the relay
                             register_session(uuid, caller, called, domain_config, call_id)
@@ -217,7 +214,7 @@ def _esl_event_loop(domain_config):
                                     ("STREAM_SUPPRESS_LOG", "false"),
                                 ):
                                     set_result = cmd_esl.api("uuid_setvar", f"{uuid} {var} {value}")
-                                    log.info("Call %s: uuid_setvar %s=%s -> %s", uuid, var, value, set_result.strip()[:120])
+                                    log.debug("Call %s: uuid_setvar %s=%s -> %s", uuid, var, value, set_result.strip()[:120])
                                 result = cmd_esl.api("uuid_audio_stream", stream_args)
                             finally:
                                 cmd_esl.close()
@@ -240,8 +237,8 @@ def _esl_event_loop(domain_config):
 
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            log.error("ESL connection error: %s — reconnecting in 5s", e)
+        except Exception:
+            log.warning("ESL connection error; reconnecting in 5s", exc_info=True)
             time.sleep(5)
 
 
@@ -262,7 +259,7 @@ def run_server():
 
     log.info("Waiting for PersonaPlex model to load (may take minutes on CPU)...")
     if not _wait_for_moshi(timeout=600):
-        log.error("PersonaPlex failed to start")
+        log.critical("PersonaPlex failed to start")
         moshi_proc.terminate()
         sys.exit(1)
     log.info("PersonaPlex ready")
@@ -296,7 +293,7 @@ def run_server():
         except Exception as e:
             relay_error["error"] = e
             relay_ready.set()
-            log.error("Audio relay startup failed: %s", e)
+            log.exception("Audio relay startup failed")
         finally:
             relay_loop.run_until_complete(_cleanup_relay())
             relay_loop.run_until_complete(relay_loop.shutdown_asyncgens())
@@ -305,7 +302,7 @@ def run_server():
     relay_thread = threading.Thread(target=_run_relay, daemon=True)
     relay_thread.start()
     if not relay_ready.wait(timeout=relay_ready_timeout):
-        log.error("Audio relay did not become ready within %ds", relay_ready_timeout)
+        log.critical("Audio relay did not become ready within %ds", relay_ready_timeout)
         with contextlib.suppress(Exception):
             moshi_proc.terminate()
         sys.exit(1)
@@ -333,11 +330,11 @@ def run_server():
         )
         try:
             prewarm_ready = future.result(timeout=prewarm_ready_timeout + 5)
-        except Exception as e:
-            log.error("Initial PersonaPlex prewarm wait failed: %s", e)
+        except Exception:
+            log.exception("Initial PersonaPlex prewarm wait failed")
             prewarm_ready = False
         if not prewarm_ready:
-            log.error("PersonaPlex prewarm is required but no real ready session was queued; exiting")
+            log.critical("PersonaPlex prewarm is required but no real ready session was queued; exiting")
             with contextlib.suppress(Exception):
                 moshi_proc.terminate()
             if relay_loop.is_running():
@@ -349,7 +346,7 @@ def run_server():
     def _watch_moshi():
         moshi_proc.wait()
         if moshi_proc.returncode != 0:
-            log.error("PersonaPlex exited with code %d", moshi_proc.returncode)
+            log.critical("PersonaPlex exited with code %d", moshi_proc.returncode)
             os._exit(1)
 
     threading.Thread(target=_watch_moshi, daemon=True).start()

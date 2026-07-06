@@ -19,10 +19,8 @@ import os
 import base64
 import contextlib
 import asyncio
-import logging
 import math
 import time
-import traceback
 import json
 import re
 import struct
@@ -38,8 +36,9 @@ import aiohttp
 from aiohttp import web
 
 import db
+from logging_config import get_logger
 
-log = logging.getLogger("agent.bridge")
+log = get_logger(__name__)
 
 MOSHI_HOST = os.getenv("MOSHI_HOST", "127.0.0.1")
 MOSHI_CONNECT_HOST = "127.0.0.1" if MOSHI_HOST in ("0.0.0.0", "::") else MOSHI_HOST
@@ -328,8 +327,8 @@ async def _broadcast_stream_audio_file_later(session: CallSession, stream_index:
             result_text[:200],
             result_text.startswith("+OK"),
         )
-    except Exception as e:
-        log.warning("Call %s: fallback uuid_broadcast failed for %s: %s", session.call_uuid, file_path, e)
+    except Exception:
+        log.warning("Call %s: fallback uuid_broadcast failed for %s", session.call_uuid, file_path, exc_info=True)
 
 
 async def _send_stream_audio_now(ws_fs, session: CallSession, raw_audio: bytes, reason: str = "immediate"):
@@ -472,8 +471,8 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     response_text = VERIFIED_AI_RESPONSE_TEXT or EXPECTED_AI_PHRASE or "Hello."
     try:
         raw_audio = await asyncio.to_thread(_build_verified_response_raw, response_text)
-    except Exception as e:
-        log.error("Call %s: verified AI response synthesis failed: %s", session.call_uuid, e)
+    except Exception:
+        log.exception("Call %s: verified AI response synthesis failed", session.call_uuid)
         return
 
     if not session.active or ws_fs.closed:
@@ -522,8 +521,8 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     try:
         await _send_stream_audio(ws_fs, session, raw_audio)
         _maybe_log_audio_stats(session)
-    except (ConnectionError, asyncio.CancelledError) as e:
-        log.warning("Call %s: Failed sending verified AI response to FreeSWITCH: %s", session.call_uuid, e)
+    except (ConnectionError, asyncio.CancelledError):
+        log.warning("Call %s: Failed sending verified AI response to FreeSWITCH", session.call_uuid, exc_info=True)
 
 
 async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
@@ -569,8 +568,8 @@ async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
                 await _maybe_send_verified_response(ws_fs, session, reason)
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        log.error("Call %s: verified-response relay error: %s", session.call_uuid, e)
+    except Exception:
+        log.exception("Call %s: verified-response relay error", session.call_uuid)
     finally:
         session.stop()
 
@@ -822,8 +821,8 @@ async def _prewarm_moshi_loop(app, domain_config):
             log.info("background-prewarm: PersonaPlex ready session queued")
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            log.error("background-prewarm: failed: %s", e)
+        except Exception:
+            log.exception("background-prewarm: failed")
             await asyncio.sleep(5)
 
 
@@ -1129,8 +1128,8 @@ async def _handle_audio_ws(request):
         if session:
             session.stop()
         raise
-    except Exception as e:
-        log.error("Call %s: Relay error: %s\n%s", call_uuid, e, traceback.format_exc())
+    except Exception:
+        log.exception("Call %s: Relay error", call_uuid)
     finally:
         if session:
             session.stop()
@@ -1183,9 +1182,9 @@ async def _flush_pending_opus_to_moshi(ws_moshi, session: CallSession, reason: s
             await ws_moshi.send_bytes(b"\x01" + opus_data)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception:
             session.pending_opus_frames = frames[sent:] + session.pending_opus_frames
-            log.warning("Call %s: Failed flushing buffered caller audio to PersonaPlex: %s", session.call_uuid, e)
+            log.warning("Call %s: Failed flushing buffered caller audio to PersonaPlex", session.call_uuid, exc_info=True)
             return False
 
         sent += 1
@@ -1282,8 +1281,8 @@ async def _drain_fs_during_handshake(ws_fs, session: CallSession, stop_event: as
                 _maybe_log_audio_stats(session)
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        log.error("Call %s: FreeSWITCH handshake drain error: %s", session.call_uuid, e)
+    except Exception:
+        log.exception("Call %s: FreeSWITCH handshake drain error", session.call_uuid)
         session.stop()
 
 
@@ -1421,15 +1420,15 @@ async def _relay_fs_to_moshi(ws_fs, ws_moshi, session: CallSession):
                         )
                     try:
                         await ws_moshi.send_bytes(b"\x01" + opus_data)
-                    except (ConnectionError, asyncio.CancelledError) as e:
-                        log.warning("Call %s: Failed sending caller audio to PersonaPlex: %s", session.call_uuid, e)
+                    except (ConnectionError, asyncio.CancelledError):
+                        log.warning("Call %s: Failed sending caller audio to PersonaPlex", session.call_uuid, exc_info=True)
                         break
                 _maybe_log_audio_stats(session)
                 await _maybe_send_verified_response(ws_fs, session, "caller_audio_detected")
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        log.error("Call %s: FS->Moshi relay error: %s", session.call_uuid, e)
+    except Exception:
+        log.exception("Call %s: FS->Moshi relay error", session.call_uuid)
     finally:
         session.stop()
 
@@ -1490,8 +1489,8 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                         try:
                             await _send_stream_audio(ws_fs, session, raw_audio)
                             _maybe_log_audio_stats(session)
-                        except (ConnectionError, asyncio.CancelledError) as e:
-                            log.warning("Call %s: Failed sending playback audio to FreeSWITCH: %s", session.call_uuid, e)
+                        except (ConnectionError, asyncio.CancelledError):
+                            log.warning("Call %s: Failed sending playback audio to FreeSWITCH", session.call_uuid, exc_info=True)
                             break
                 elif kind == 2:  # Agent text token
                     text = payload.decode("utf-8", "replace")
@@ -1509,8 +1508,8 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                 break
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        log.error("Call %s: Moshi->FS relay error: %s", session.call_uuid, e)
+    except Exception:
+        log.exception("Call %s: Moshi->FS relay error", session.call_uuid)
     finally:
         if FS_PLAYBACK_BROADCAST_FALLBACK:
             task = session.stream_audio_batch_task
@@ -1598,8 +1597,8 @@ def _finalize_call(session: CallSession):
                 ),
             )
             log.info("Call %s: Saved transcript (%d chars)", session.call_uuid, len(transcript))
-        except Exception as e:
-            log.error("Call %s: DB end_call failed: %s", session.call_uuid, e)
+        except Exception:
+            log.warning("Call %s: DB end_call failed", session.call_uuid, exc_info=True)
 
 
 def _save_pcm_wav(session: CallSession, path: str, chunks: List[bytes], sample_rate: int, label: str):
@@ -1618,8 +1617,8 @@ def _save_pcm_wav(session: CallSession, path: str, chunks: List[bytes], sample_r
             sum(len(chunk) for chunk in chunks),
             sample_rate,
         )
-    except Exception as e:
-        log.error("Call %s: Failed saving direct %s audio: %s", session.call_uuid, label, e)
+    except Exception:
+        log.exception("Call %s: Failed saving direct %s audio", session.call_uuid, label)
 
 
 def _phrase_present(text: str, phrase: str) -> bool:

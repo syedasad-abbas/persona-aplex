@@ -2,7 +2,9 @@
 set -eu
 
 log() {
-  printf '%s\n' "[all-in-one] $*"
+  level="${1:-INFO}"
+  shift || true
+  printf '%s %s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "all-in-one" "$*"
 }
 
 FS_ESL_HOST="${FS_ESL_HOST:-127.0.0.1}"
@@ -13,7 +15,7 @@ APP_PID=""
 FS_PID=""
 
 stop_children() {
-  log "Stopping services"
+  log INFO "Stopping services"
   if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
     kill "$APP_PID" 2>/dev/null || true
   fi
@@ -25,42 +27,42 @@ stop_children() {
 
 trap 'stop_children; exit 0' INT TERM
 
-log "Preparing FreeSWITCH configuration"
+log INFO "Preparing FreeSWITCH configuration"
 /usr/local/bin/freeswitch-entrypoint.sh /bin/true
 
-log "Starting FreeSWITCH"
+log INFO "Starting FreeSWITCH"
 /usr/local/freeswitch/bin/freeswitch -nonat &
 FS_PID="$!"
 
-log "Waiting for FreeSWITCH ESL at ${FS_ESL_HOST}:${FS_ESL_PORT}"
+log INFO "Waiting for FreeSWITCH ESL at ${FS_ESL_HOST}:${FS_ESL_PORT}"
 i=0
 while ! nc -z "$FS_ESL_HOST" "$FS_ESL_PORT"; do
   i=$((i + 1))
   if [ "$i" -ge "$FS_START_TIMEOUT" ]; then
-    log "FreeSWITCH ESL did not become ready within ${FS_START_TIMEOUT}s"
+    log CRITICAL "FreeSWITCH ESL did not become ready within ${FS_START_TIMEOUT}s"
     stop_children
     exit 1
   fi
   if ! kill -0 "$FS_PID" 2>/dev/null; then
-    log "FreeSWITCH exited before ESL became ready"
+    log CRITICAL "FreeSWITCH exited before ESL became ready"
     stop_children
     exit 1
   fi
   sleep 1
 done
 
-log "Starting PersonaPlex app"
+log INFO "Starting PersonaPlex app"
 python3.12 /app/app.py &
 APP_PID="$!"
 
 while true; do
   if ! kill -0 "$FS_PID" 2>/dev/null; then
-    log "FreeSWITCH exited"
+    log CRITICAL "FreeSWITCH exited"
     stop_children
     exit 1
   fi
   if ! kill -0 "$APP_PID" 2>/dev/null; then
-    log "PersonaPlex app exited"
+    log CRITICAL "PersonaPlex app exited"
     stop_children
     exit 1
   fi

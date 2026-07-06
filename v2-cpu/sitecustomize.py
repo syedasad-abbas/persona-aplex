@@ -2,6 +2,10 @@
 
 import os
 
+from logging_config import get_logger
+
+log = get_logger("agent.sitecustomize")
+
 try:
     import torch
 except Exception:
@@ -30,7 +34,7 @@ if torch is not None:
         try:
             torch.set_num_interop_threads(_interop_threads)
         except RuntimeError:
-            pass
+            log.debug("Unable to set torch interop threads", exc_info=True)
 
 if torch is not None and not torch.cuda.is_available():
     _torch_load = torch.load
@@ -62,7 +66,7 @@ if _moshi_lm is not None:
 
     if os.getenv("MOSHI_SKIP_VOICE_PROMPT_STEPS", "0").lower() in ("1", "true", "yes"):
         def _skip_voice_prompt_core(self, mimi):
-            print("Skipping voice prompt steps (MOSHI_SKIP_VOICE_PROMPT_STEPS=1).")
+            log.info("Skipping voice prompt steps (MOSHI_SKIP_VOICE_PROMPT_STEPS=1).")
             if False:
                 yield None
 
@@ -73,13 +77,13 @@ if _moshi_lm is not None:
         _keep_silence = os.getenv("MOSHI_SKIP_SYSTEM_PROMPTS_KEEP_SILENCE", "1").lower() in ("1", "true", "yes")
 
         async def _skip_system_prompts_async(self, mimi, is_alive=None):
-            print("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            log.info("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
             if _keep_silence:
                 await self._step_audio_silence_async(is_alive)
             return None
 
         def _skip_system_prompts(self, mimi):
-            print("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
+            log.info("Skipping voice/text prompt steps (MOSHI_SKIP_SYSTEM_PROMPTS=1).")
             if _keep_silence:
                 self._step_audio_silence()
             return None

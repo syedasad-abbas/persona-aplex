@@ -2,7 +2,9 @@
 set -eu
 
 log() {
-  printf '%s\n' "[freeswitch-entrypoint] $*"
+  level="${1:-INFO}"
+  shift || true
+  printf '%s %s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "freeswitch-entrypoint" "$*"
 }
 
 valid_ipv4() {
@@ -71,12 +73,12 @@ if ip="$(detect_public_ip)"; then
       /usr/local/freeswitch/conf/vars.xml; do
       update_vars_file "$vars_file" "$ip" "$sip_domain"
     done
-    log "Using external_sip_ip/external_rtp_ip=${ip}, domain=${sip_domain}"
+    log INFO "Using external_sip_ip/external_rtp_ip=${ip}, domain=${sip_domain}"
   else
-    log "Detected invalid public IP '${ip}', leaving vars.xml unchanged"
+    log WARNING "Detected invalid public IP '${ip}', leaving vars.xml unchanged"
   fi
 else
-  log "Could not detect public IP, leaving vars.xml unchanged"
+  log WARNING "Could not detect public IP, leaving vars.xml unchanged"
 fi
 
 exec "$@"
