@@ -21,8 +21,8 @@
         <action application="record_session" data="/tmp/personaplex_agent_${uuid}.wav"/>
         <action application="set" data="hangup_after_bridge=true"/>
         <action application="set" data="playback_terminators=none"/>
-        <!-- Park the call — the ESL bridge will start uuid_audio_stream -->
-        <action application="park"/>
+        <!-- Keep a silent outbound media clock; mod_audio_stream replaces it with Moshi audio. -->
+        <action application="playback" data="silence_stream://-1"/>
       </condition>
     </condition>
   </extension>

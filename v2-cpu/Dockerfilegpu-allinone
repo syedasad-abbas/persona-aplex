@@ -1,0 +1,95 @@
+FROM vultik1/fs:0.1
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG PYTHON_VERSION=3.12.4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    ffmpeg git ca-certificates build-essential pkg-config libopus-dev \
+    cmake iproute2 tcpdump netcat-openbsd wget \
+    zlib1g zlib1g-dev libssl-dev libevent-dev \
+    libspeexdsp1 libspeexdsp-dev \
+    libbz2-dev libffi-dev libreadline-dev libsqlite3-dev liblzma-dev uuid-dev xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz -O /tmp/Python.tgz \
+    && mkdir -p /tmp/python-src \
+    && tar -xzf /tmp/Python.tgz -C /tmp/python-src --strip-components=1 \
+    && cd /tmp/python-src \
+    && ./configure --enable-optimizations \
+    && make -j"$(nproc)" \
+    && make altinstall \
+    && python3.12 -m ensurepip --upgrade \
+    && ln -sf /usr/local/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip3 \
+    && rm -rf /tmp/Python.tgz /tmp/python-src
+
+
+COPY freeswitch/conf/vars.xml /usr/local/freeswitch/vars.xml
+COPY freeswitch/conf/vars.xml /usr/local/freeswitch/conf/vars.xml
+COPY freeswitch/conf/directory/ /usr/local/freeswitch/directory/
+COPY freeswitch/conf/directory/ /usr/local/freeswitch/conf/directory/
+COPY freeswitch/conf/autoload_configs/ /usr/local/freeswitch/autoload_configs/
+COPY freeswitch/conf/autoload_configs/ /usr/local/freeswitch/conf/autoload_configs/
+COPY freeswitch/conf/sip_profiles/ /usr/local/freeswitch/sip_profiles/
+COPY freeswitch/conf/sip_profiles/ /usr/local/freeswitch/conf/sip_profiles/
+COPY freeswitch/conf/dialplan/ /usr/local/freeswitch/dialplan/
+COPY freeswitch/conf/dialplan/ /usr/local/freeswitch/conf/dialplan/
+
+RUN set -eux; \
+    modules_file="/usr/local/freeswitch/conf/autoload_configs/modules.conf.xml"; \
+    for mod in mod_event_socket mod_sofia mod_commands mod_dptools mod_audio_stream mod_http_cache mod_avmd mod_vmd; do \
+        if ! grep -q "<load module=\"${mod}\"/>" "${modules_file}"; then \
+            sed -i "/<\/modules>/i\    <load module=\"${mod}\"/>" "${modules_file}"; \
+        fi; \
+    done
+
+COPY freeswitch/patches/patch_mod_audio_stream_playback.py /tmp/patch_mod_audio_stream_playback.py
+RUN set -eux; \
+    git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /tmp/mod_audio_stream; \
+    cd /tmp/mod_audio_stream; \
+    git submodule update --init --recursive; \
+    python3 /tmp/patch_mod_audio_stream_playback.py /tmp/mod_audio_stream; \
+    mkdir build; \
+    cd build; \
+    PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig cmake -DCMAKE_BUILD_TYPE=Release ..; \
+    make -j"$(nproc)"; \
+    install -m 0755 mod_audio_stream.so /usr/local/freeswitch/mod/mod_audio_stream.so; \
+    rm -rf /tmp/mod_audio_stream; \
+    test -f /usr/local/freeswitch/mod/mod_audio_stream.so
+
+WORKDIR /app
+COPY v2-cpu/requirements.txt .
+RUN python3.12 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python3.12 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && git clone --depth 1 https://github.com/NVIDIA/personaplex.git /tmp/personaplex \
+    && python3.12 -m pip install --no-cache-dir /tmp/personaplex/moshi/ \
+    && python3.12 -m pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /tmp/personaplex
+
+COPY v2-cpu/ /app/
+COPY freeswitch/scripts/freeswitch-entrypoint.sh /usr/local/bin/freeswitch-entrypoint.sh
+COPY freeswitch/scripts/test-sip-register.sh /usr/local/bin/test-sip-register.sh
+COPY docker-entrypoint-allinone.sh /usr/local/bin/docker-entrypoint-allinone.sh
+
+RUN chmod +x /usr/local/bin/freeswitch-entrypoint.sh \
+    /usr/local/bin/test-sip-register.sh \
+    /usr/local/bin/docker-entrypoint-allinone.sh \
+    && mkdir -p /app/cache /var/lib/freeswitch/http_cache
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    MOSHI_DEVICE=cuda \
+    MOSHI_HOST=0.0.0.0 \
+    MOSHI_PORT=8998 \
+    FS_ESL_HOST=127.0.0.1 \
+    FS_ESL_PORT=8021 \
+    FS_ESL_PASSWORD=FS!Secure2026 \
+    RELAY_HOST=127.0.0.1 \
+    HF_HOME=/app/cache/hf \
+    PATH="/usr/local/freeswitch/bin:${PATH}"
+
+VOLUME ["/var/lib/freeswitch/http_cache"]
+EXPOSE 5060/udp 5060/tcp 5090/udp 5090/tcp 5080/udp 5080/tcp 8021/tcp 4000-4100/udp 8998
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-allinone.sh"]

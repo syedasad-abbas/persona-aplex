@@ -47,15 +47,17 @@ RUN set -eux; \
 
 # Build mod_audio_stream against this Debian 11 FreeSWITCH image.  The
 # prebuilt upstream package is Debian 12 and requires newer glibc/OpenSSL.
+COPY patches/patch_mod_audio_stream_playback.py /tmp/patch_mod_audio_stream_playback.py
 RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		ca-certificates git cmake build-essential pkg-config iproute2 \
+		ca-certificates git cmake build-essential pkg-config python3 iproute2 \
 		tcpdump netcat-openbsd \
 		zlib1g zlib1g-dev libssl1.1 libssl-dev libevent-dev libspeexdsp1 libspeexdsp-dev; \
 	git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /tmp/mod_audio_stream; \
 	cd /tmp/mod_audio_stream; \
 	git submodule update --init --recursive; \
+	python3 /tmp/patch_mod_audio_stream_playback.py /tmp/mod_audio_stream; \
 	mkdir build; \
 	cd build; \
 	PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig cmake -DCMAKE_BUILD_TYPE=Release ..; \
