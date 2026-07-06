@@ -18,6 +18,9 @@ services:
       - FS_PUBLIC_IP=${FS_PUBLIC_IP:-192.169.46.42}
       - FS_PUBLIC_IP_URL=${FS_PUBLIC_IP_URL:-https://api.ipify.org}
       - FS_SIP_DOMAIN=${FS_SIP_DOMAIN:-192.169.46.42}
+      - FS_SIPTRACE=${FS_SIPTRACE:-0}
+      - FS_CONSOLE_LOGLEVEL=${FS_CONSOLE_LOGLEVEL:-info}
+      - FS_SIPTRACE_LOGLEVEL=${FS_SIPTRACE_LOGLEVEL:-debug}
 
       # External MySQL
       - DB_HOST=${DB_HOST}

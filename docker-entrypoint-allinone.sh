@@ -51,6 +51,22 @@ while ! nc -z "$FS_ESL_HOST" "$FS_ESL_PORT"; do
   sleep 1
 done
 
+FS_CLI="/usr/local/freeswitch/bin/fs_cli"
+
+if [ "${FS_SIPTRACE:-0}" = "1" ]; then
+  log INFO "Enabling FreeSWITCH SIP trace"
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "console loglevel ${FS_SIPTRACE_LOGLEVEL:-debug}" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia global siptrace on" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia profile internal siptrace on" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia profile external siptrace on" || true
+else
+  log INFO "Disabling FreeSWITCH SIP trace"
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "console loglevel ${FS_CONSOLE_LOGLEVEL:-info}" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia global siptrace off" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia profile internal siptrace off" || true
+  "$FS_CLI" -H "$FS_ESL_HOST" -P "$FS_ESL_PORT" -p "$FS_ESL_PASSWORD" -x "sofia profile external siptrace off" || true
+fi
+
 log INFO "Starting PersonaPlex app"
 python3.12 /app/app.py &
 APP_PID="$!"

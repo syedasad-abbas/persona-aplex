@@ -47,10 +47,10 @@
     <!-- Can be set to "_undef_" to remove the User-Agent header -->
     <!-- <param name="user-agent-string" value="FreeSWITCH Rocks!"/> -->
 
-    <param name="debug" value="1"/>
+    <param name="debug" value="0"/>
     <!-- If you want FreeSWITCH to shutdown if this profile fails to load, uncomment the next line. -->
     <!-- <param name="shutdown-on-fail" value="true"/> -->
-    <param name="sip-trace" value="yes"/>
+    <param name="sip-trace" value="no"/>
     <param name="sip-capture" value="no"/>
 
     <!-- Use presence_map.conf.xml to convert extension regex to presence protos for routing -->
