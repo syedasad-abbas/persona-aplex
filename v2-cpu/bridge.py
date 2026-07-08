@@ -28,7 +28,9 @@ import subprocess
 import tempfile
 import threading
 import wave
+import stt
 from typing import Optional, List
+from conversation_logger import ConversationLogger
 
 import numpy as np
 import sphn
@@ -39,6 +41,8 @@ import db
 from logging_config import get_logger
 
 log = get_logger(__name__)
+
+STT_ENABLED = stt.STT_ENABLED
 
 MOSHI_HOST = os.getenv("MOSHI_HOST", "127.0.0.1")
 MOSHI_CONNECT_HOST = "127.0.0.1" if MOSHI_HOST in ("0.0.0.0", "::") else MOSHI_HOST
@@ -173,11 +177,14 @@ class CallSession:
         self.transcript_tokens: List[str] = []
         self.started_at = time.time()
         self.moshi_ws = None
+        self.ai_turn_buffer: List[str] = []
+        self.ai_turn_last_token_at = 0.0
         self.opus_writer = sphn.OpusStreamWriter(MOSHI_SAMPLE_RATE)
         self.opus_reader = sphn.OpusStreamReader(MOSHI_SAMPLE_RATE)
         self._active = True
         self.finalized = False
         self.fs_audio_frames = 0
+        self.conversation_logger = None
         self.fs_audio_bytes = 0
         self.fs_audio_peak = 0
         self.fs_text_frames = 0
@@ -214,6 +221,7 @@ class CallSession:
         self.verified_response_frames = 0
         self.moshi_audio_suppressed = 0
         self.moshi_text_suppressed = 0
+        self.stt_session = None
 
     @property
     def active(self):
@@ -227,6 +235,7 @@ class CallSession:
 _sessions: dict[str, CallSession] = {}
 _sessions_lock = threading.Lock()
 _moshi_session_lock: Optional[asyncio.Lock] = None
+_relay_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def _get_moshi_session_lock() -> asyncio.Lock:
@@ -496,6 +505,13 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     session.verified_response_bytes = len(raw_audio)
     session.verified_response_frames += 1
     session.transcript_tokens.append(response_text)
+    if session.conversation_logger:
+        await session.conversation_logger.add_turn(
+            "ai",
+            response_text,
+            source_used="verified_response",
+            quality_label=f"reason={reason}",
+        )
     duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
 
     peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
@@ -895,6 +911,9 @@ async def start_relay_server(domain_config):
       - Receive: 0x02 + utf8_text    (agent text tokens)
       - Receive: 0x00                (handshake / ready)
     """
+    global _relay_loop
+    _relay_loop = asyncio.get_running_loop()
+
     app = web.Application()
     app.router.add_get("/audio", _handle_audio_ws)
     app["domain_config"] = domain_config
@@ -1009,6 +1028,24 @@ async def _handle_audio_ws(request):
             await ws_fs.close()
             return ws_fs
 
+        if session.conversation_logger:
+            session.conversation_logger.start()
+        if STT_ENABLED and session.conversation_logger:
+            async def on_final_caller_text(text, confidence=None):
+                await session.conversation_logger.add_turn(
+                    "caller",
+                    text,
+                    source_used="deepgram_realtime",
+                    quality_label=f"confidence={confidence:.3f}" if confidence is not None else None,
+                )
+
+            stt_session = stt.StreamingSTTSession(
+                call_uuid=session.call_uuid,
+                sample_rate=FS_SAMPLE_RATE,
+                on_final_text=on_final_caller_text,
+            )
+            if stt_session.start():
+                session.stt_session = stt_session
         log.info("Call %s: Audio relay connected caller=%s called=%s", call_uuid, session.caller, session.called)
 
         if VERIFIED_AI_RESPONSE_ENABLED and VERIFIED_AI_RESPONSE_MODE == "only":
@@ -1135,7 +1172,7 @@ async def _handle_audio_ws(request):
             session.stop()
             _forget_session(session)
             _log_audio_stats(session, "final audio stats")
-            _finalize_call(session)
+            await _finalize_call(session)
         if not cancelled and not ws_fs.closed:
             with contextlib.suppress(Exception, RuntimeError):
                 await ws_fs.close()
@@ -1358,6 +1395,7 @@ async def _run_bidirectional_relay(ws_fs, ws_moshi, session: CallSession):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
     finally:
+        await _flush_ai_turn(session, "relay_end")
         session.stop()
 
 
@@ -1403,6 +1441,12 @@ async def _relay_fs_to_moshi(ws_fs, ws_moshi, session: CallSession):
                 break
 
             if pcm is not None:
+                if session.stt_session:
+                    stt_l16 = _pcm_float_to_l16_bytes(
+                        _resample_linear(pcm, sample_rate, FS_SAMPLE_RATE)
+                    )
+                    await session.stt_session.send_audio(stt_l16)
+
                 pcm = _apply_gain(pcm, INBOUND_GAIN)
                 pcm_24k = _resample_linear(pcm, sample_rate, MOSHI_SAMPLE_RATE)
                 session.opus_writer.append_pcm(pcm_24k)
@@ -1494,10 +1538,24 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                             break
                 elif kind == 2:  # Agent text token
                     text = payload.decode("utf-8", "replace")
+
                     session.transcript_tokens.append(text)
+                    session.ai_turn_buffer.append(text)
+                    session.ai_turn_last_token_at = time.time()
                     session.moshi_text_frames += 1
+
                     if session.moshi_text_frames <= 5:
-                        log.info("Call %s: PersonaPlex text token #%d: %r", session.call_uuid, session.moshi_text_frames, text)
+                        log.info(
+                            "Call %s: PersonaPlex text token #%d: %r",
+                            session.call_uuid,
+                            session.moshi_text_frames,
+                            text,
+                        )
+
+                    current_ai_text = "".join(session.ai_turn_buffer)
+
+                    if _ai_text_has_sentence_end(current_ai_text):
+                        await _flush_ai_turn(session, "sentence_end")
                 else:
                     log.warning("Call %s: Unknown PersonaPlex frame kind=%s bytes=%d", session.call_uuid, kind, len(payload))
             elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -1550,6 +1608,7 @@ def register_session(call_uuid: str, caller: str, called: str,
                      domain_config, call_id: Optional[int] = None) -> CallSession:
     """Register a new call session (called from the ESL event handler)."""
     session = CallSession(call_uuid, caller, called, domain_config, call_id)
+    session.conversation_logger = ConversationLogger(call_id, call_uuid)
     with _sessions_lock:
         old_session = _sessions.get(call_uuid)
         if old_session:
@@ -1566,10 +1625,21 @@ def unregister_session(call_uuid: str):
     if session:
         session.stop()
         _log_audio_stats(session, "hangup audio stats")
-        _finalize_call(session)
+        if _relay_loop and _relay_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(_finalize_call(session), _relay_loop)
+
+            def _log_finalize_error(done):
+                try:
+                    done.result()
+                except Exception:
+                    log.warning("Call %s: Async finalization failed", call_uuid, exc_info=True)
+
+            future.add_done_callback(_log_finalize_error)
+        else:
+            log.warning("Call %s: Relay loop unavailable; cannot finalize asynchronously", call_uuid)
 
 
-def _finalize_call(session: CallSession):
+async def _finalize_call(session: CallSession):
     """Post-call: save transcript to DB."""
     if session.finalized:
         return
@@ -1584,6 +1654,12 @@ def _finalize_call(session: CallSession):
         _save_pcm_wav(session, ai_path, session.ai_pcm_chunks, FS_PLAYBACK_SAMPLE_RATE, "AI")
     transcript = "".join(session.transcript_tokens).strip()
     _log_audio_proof(session, caller_path, ai_path, transcript)
+    if session.stt_session:
+        try:
+            await session.stt_session.close()
+        except Exception:
+            log.warning("Call %s: Failed to close STT session", session.call_uuid, exc_info=True)
+    await _flush_ai_turn(session, "finalize")
     if session.call_id:
         try:
             db.end_call(
@@ -1599,6 +1675,11 @@ def _finalize_call(session: CallSession):
             log.info("Call %s: Saved transcript (%d chars)", session.call_uuid, len(transcript))
         except Exception:
             log.warning("Call %s: DB end_call failed", session.call_uuid, exc_info=True)
+    if session.conversation_logger:
+        try:
+            await session.conversation_logger.close()
+        except Exception:
+            log.warning("Call %s: Failed to close conversation logger", session.call_uuid, exc_info=True)
 
 
 def _save_pcm_wav(session: CallSession, path: str, chunks: List[bytes], sample_rate: int, label: str):
@@ -1712,4 +1793,24 @@ def _log_audio_proof(session: CallSession, caller_path: str, ai_path: str, trans
         ai_path or "missing",
         session.verified_response_sent,
         session.verified_response_source or "none",
+    )
+
+def _ai_text_has_sentence_end(text: str) -> bool:
+    return text.rstrip().endswith((".", "?", "!", "\n"))
+
+async def _flush_ai_turn(session: CallSession, reason: str):
+    if not session.conversation_logger:
+        return
+
+    text = "".join(session.ai_turn_buffer).strip()
+    if not text:
+        return
+
+    session.ai_turn_buffer.clear()
+
+    await session.conversation_logger.add_turn(
+        "ai",
+        text,
+        source_used="personaplex",
+        quality_label=f"flush_reason={reason}",
     )

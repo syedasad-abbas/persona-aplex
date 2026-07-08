@@ -44,6 +44,14 @@ services:
       - VOICE_PROMPT=NATF2.pt
       - AGENT_DOMAIN=appointment
 
+      # Speech-to-Text
+      - STT_ENABLED=1
+      - STT_PROVIDER=deepgram
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - STT_MODEL=nova-3
+      - STT_LANGUAGE=en-US
+      - STT_ENDPOINTING_MS=300
+
       # Relay now points to localhost
       - RELAY_HOST=127.0.0.1
 
@@ -82,7 +90,7 @@ services:
       - AUDIBLE_MIN_ACTIVE_MS=150
 
       - RELAY_READY_TIMEOUT=120
-      - REQUIRE_MOSHI_PREWARM_READY=1
+      - REQUIRE_MOSHI_PREWARM_READY=0
       - MOSHI_INITIAL_PREWARM_READY_TIMEOUT=1800
 
       - AUDIO_STATS_INTERVAL=5

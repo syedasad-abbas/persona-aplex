@@ -21,6 +21,55 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     INDEX idx_domain (domain)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    call_id         BIGINT NOT NULL,
+    turn_index      INT NOT NULL,
+    role            ENUM('caller','ai','system') NOT NULL,
+    text            LONGTEXT NOT NULL,
+    intent          VARCHAR(100),
+    is_off_topic    BOOLEAN DEFAULT FALSE,
+    source_used     VARCHAR(100),
+    quality_label   VARCHAR(100),
+    corrected_text   LONGTEXT,
+    review_label     VARCHAR(100),
+    reviewer_notes   TEXT,
+    include_in_training BOOLEAN DEFAULT FALSE,
+    reviewed_at      DATETIME,
+    reviewed_by      VARCHAR(100),
+    memory_scope     ENUM('none','current_call','customer_fact','training_only','discard') NOT NULL DEFAULT 'none',
+    memory_summary   TEXT,
+    use_in_live_context BOOLEAN DEFAULT FALSE,
+    memory_expires_at DATETIME,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_call_turn (call_id, turn_index),
+    INDEX idx_role (role),
+    INDEX idx_training (include_in_training, role),
+    INDEX idx_review_label (review_label),
+    INDEX idx_memory_scope (memory_scope),
+    INDEX idx_live_memory (use_in_live_context, memory_scope),
+    FOREIGN KEY (call_id) REFERENCES agent_calls(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS customer_memory_facts (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    caller_number   VARCHAR(50) NOT NULL,
+    fact_key        VARCHAR(100) NOT NULL,
+    fact_value      TEXT NOT NULL,
+    source_call_id  BIGINT,
+    source_turn_id  BIGINT,
+    confidence      DECIMAL(5,4),
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_caller_fact (caller_number, fact_key),
+    INDEX idx_caller_active (caller_number, is_active),
+    FOREIGN KEY (source_call_id) REFERENCES agent_calls(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_turn_id) REFERENCES conversation_turns(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS agent_collected_data (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
     call_id         BIGINT NOT NULL,
