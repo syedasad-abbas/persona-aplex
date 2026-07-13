@@ -21,6 +21,8 @@ _schema_lock = threading.Lock()
 _conversation_schema_ready = False
 
 _CONVERSATION_REVIEW_COLUMNS = {
+    "start_ms": "BIGINT NULL",
+    "end_ms": "BIGINT NULL",
     "corrected_text": "LONGTEXT NULL",
     "review_label": "VARCHAR(100) NULL",
     "reviewer_notes": "TEXT NULL",
@@ -77,6 +79,8 @@ def ensure_conversation_review_schema(conn=None):
                         is_off_topic    BOOLEAN DEFAULT FALSE,
                         source_used     VARCHAR(100),
                         quality_label   VARCHAR(100),
+                        start_ms        BIGINT,
+                        end_ms          BIGINT,
                         corrected_text  LONGTEXT,
                         review_label    VARCHAR(100),
                         reviewer_notes  TEXT,
@@ -230,6 +234,8 @@ def save_conversation_turn(
     is_off_topic=False,
     source_used=None,
     quality_label=None,
+    start_ms=None,
+    end_ms=None,
 ):
     conn = get_conn()
     try:
@@ -237,8 +243,8 @@ def save_conversation_turn(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO conversation_turns "
-                "(call_id, turn_index, role, text, intent, is_off_topic, source_used, quality_label) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "(call_id, turn_index, role, text, intent, is_off_topic, source_used, quality_label, start_ms, end_ms) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     call_id,
                     turn_index,
@@ -248,6 +254,8 @@ def save_conversation_turn(
                     is_off_topic,
                     source_used,
                     quality_label,
+                    start_ms,
+                    end_ms,
                 ),
             )
             return cur.lastrowid

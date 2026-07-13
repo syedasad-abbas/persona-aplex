@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     is_off_topic    BOOLEAN DEFAULT FALSE,
     source_used     VARCHAR(100),
     quality_label   VARCHAR(100),
+    start_ms         BIGINT,
+    end_ms           BIGINT,
     corrected_text   LONGTEXT,
     review_label     VARCHAR(100),
     reviewer_notes   TEXT,

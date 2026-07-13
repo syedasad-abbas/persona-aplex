@@ -5,4 +5,5 @@ python-dotenv>=1.0.0
 sphn>=0.1.4,<0.2
 numpy>=1.26,<2.2
 aiohttp>=3.10.5,<3.11
+# OPTIONAL LOCAL STT: only required when STT_ENABLED=1
 faster-whisper>=1.0.0

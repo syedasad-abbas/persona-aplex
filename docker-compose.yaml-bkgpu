@@ -1,5 +1,6 @@
 services:
   personaplex-fs:
+    network_mode: host
     build:
       context: .
       dockerfile: v2-cpu/Dockerfilegpu-allinone
@@ -15,9 +16,6 @@ services:
       - FS_ESL_PASSWORD=FS!Secure2026
 
       # FreeSWITCH SIP
-      - FS_PUBLIC_IP=${FS_PUBLIC_IP:-192.169.46.42}
-      - FS_PUBLIC_IP_URL=${FS_PUBLIC_IP_URL:-https://api.ipify.org}
-      - FS_SIP_DOMAIN=${FS_SIP_DOMAIN:-192.169.46.42}
       - FS_SIPTRACE=${FS_SIPTRACE:-0}
       - FS_CONSOLE_LOGLEVEL=${FS_CONSOLE_LOGLEVEL:-info}
       - FS_SIPTRACE_LOGLEVEL=${FS_SIPTRACE_LOGLEVEL:-debug}
@@ -44,13 +42,19 @@ services:
       - VOICE_PROMPT=NATF2.pt
       - AGENT_DOMAIN=appointment
 
-      # Speech-to-Text
+      # ── OPTIONAL LOCAL STT START ─────────────────────────────
+      # Comment STT_ENABLED out to disable caller transcription.
       - STT_ENABLED=1
-      - STT_PROVIDER=deepgram
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - STT_MODEL=nova-3
-      - STT_LANGUAGE=en-US
-      - STT_ENDPOINTING_MS=300
+      - STT_PROVIDER=faster_whisper
+      - WHISPER_MODEL=tiny.en
+      - STT_DEVICE=cpu
+      - STT_COMPUTE_TYPE=int8
+      - STT_LANGUAGE=en
+      - STT_ENDPOINTING_MS=600
+      - STT_QUEUE_MAX_CHUNKS=500
+      # Keep disabled until the rule-based intent guard is tuned on real calls.
+      - OFF_TOPIC_REDIRECT_ENABLED=0
+      # ── OPTIONAL LOCAL STT END ───────────────────────────────
 
       # Relay now points to localhost
       - RELAY_HOST=127.0.0.1
@@ -104,15 +108,6 @@ services:
       - FS_PLAYBACK_BROADCAST_BATCH_MS=480
       - FS_PLAYBACK_BROADCAST_MAX_DELAY_MS=8000
       - FS_PLAYBACK_BROADCAST_DELAY=0.10
-
-    ports:
-      - "5060:5060/udp"
-      - "5060:5060/tcp"
-      - "5090:5060/udp"
-      - "5090:5060/tcp"
-      - "5080:5080/udp"
-      - "8021:8021/tcp"
-      - "4000-4100:4000-4100/udp"
 
     ulimits:
       nofile:

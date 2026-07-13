@@ -264,6 +264,21 @@ def run_server():
         sys.exit(1)
     log.info("PersonaPlex ready")
 
+    # Optional local caller transcription is preloaded before the relay and
+    # ESL loop start, so model download/initialization never lands on a live
+    # call. With STT_ENABLED=0 this is a cheap no-op and faster-whisper is not
+    # imported at all.
+    import stt
+    if stt.STT_ENABLED:
+        log.info("Preloading local STT model before accepting calls...")
+        try:
+            stt.preload_model()
+        except Exception:
+            log.critical("Local STT model failed to preload", exc_info=True)
+            moshi_proc.terminate()
+            sys.exit(1)
+        log.info("Local STT model ready")
+
     # 2. Start audio relay server (async)
     from bridge import start_relay_server, wait_for_moshi_prewarm_ready
     relay_loop = asyncio.new_event_loop()

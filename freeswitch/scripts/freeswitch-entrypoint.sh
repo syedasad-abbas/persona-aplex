@@ -31,25 +31,18 @@ private_ipv4() {
   return 1
 }
 
-detect_public_ip() {
-  if [ -n "${FS_PUBLIC_IP:-}" ]; then
-    printf '%s' "$FS_PUBLIC_IP"
-    return 0
-  fi
-
-  for url in \
-    "${FS_PUBLIC_IP_URL:-https://api.ipify.org}" \
-    "http://checkip.amazonaws.com" \
-    "http://icanhazip.com"; do
-    ip="$(wget -qO- --timeout=5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if valid_ipv4 "$ip" && ! private_ipv4 "$ip"; then
-      printf '%s' "$ip"
-      return 0
-    fi
-  done
-
-  return 1
+detect_host_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == "src" && (i + 1) <= NF) {
+          print $(i + 1)
+          exit
+        }
+      }
+    }'
 }
+
 
 update_vars_file() {
   file="$1"
@@ -65,20 +58,21 @@ update_vars_file() {
     "$file"
 }
 
-if ip="$(detect_public_ip)"; then
-  if valid_ipv4 "$ip"; then
-    sip_domain="${FS_SIP_DOMAIN:-$ip}"
-    for vars_file in \
-      /usr/local/freeswitch/vars.xml \
-      /usr/local/freeswitch/conf/vars.xml; do
-      update_vars_file "$vars_file" "$ip" "$sip_domain"
-    done
-    log INFO "Using external_sip_ip/external_rtp_ip=${ip}, domain=${sip_domain}"
-  else
-    log WARNING "Detected invalid public IP '${ip}', leaving vars.xml unchanged"
-  fi
-else
-  log WARNING "Could not detect public IP, leaving vars.xml unchanged"
+ip="$(detect_host_ip || true)"
+
+if ! valid_ipv4 "$ip"; then
+  log CRITICAL "Could not detect a valid host IPv4 address"
+  exit 1
 fi
+
+sip_domain="$ip"
+
+for vars_file in \
+  /usr/local/freeswitch/vars.xml \
+  /usr/local/freeswitch/conf/vars.xml; do
+  update_vars_file "$vars_file" "$ip" "$sip_domain"
+done
+
+log INFO "Using external_sip_ip/external_rtp_ip=${ip}, domain=${sip_domain}"
 
 exec "$@"

@@ -100,6 +100,22 @@ VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER = os.getenv(
     "VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER", "1"
 ).lower() in ("1", "true", "yes")
 
+# --- Off-topic detection / redirect (rule-based STT/intent guard) ---
+APPOINTMENT_KEYWORDS = {
+    "appointment", "book", "schedule", "doctor", "clinic",
+    "health", "medical", "name", "phone", "tomorrow", "today",
+    "morning", "afternoon", "cancel", "reschedule",
+}
+OFF_TOPIC_REDIRECT_ENABLED = os.getenv("OFF_TOPIC_REDIRECT_ENABLED", "0").lower() in ("1", "true", "yes")
+OFF_TOPIC_REDIRECT_TEXT = os.getenv(
+    "OFF_TOPIC_REDIRECT_TEXT",
+    "I'm sorry, I can only help with appointment booking. "
+    "Would you like to continue scheduling your appointment?",
+).strip()
+# Minimum seconds between redirects so a chatty off-topic caller doesn't get
+# spammed with the same TTS line on every single utterance.
+OFF_TOPIC_REDIRECT_COOLDOWN_S = float(os.getenv("OFF_TOPIC_REDIRECT_COOLDOWN_S", "6"))
+
 # mod_audio_stream sends L16 at this rate
 FS_SAMPLE_RATE = 16000
 # Match the uuid_audio_stream sample rate unless explicitly overridden.
@@ -222,6 +238,11 @@ class CallSession:
         self.moshi_audio_suppressed = 0
         self.moshi_text_suppressed = 0
         self.stt_session = None
+        self.off_topic_redirect_count = 0
+        self.last_off_topic_redirect_ts = 0.0
+        # ms from session.started_at when the current agent sentence's first
+        # text token arrived; None when no agent turn is in progress.
+        self.agent_turn_start_ms = None
 
     @property
     def active(self):
@@ -505,14 +526,18 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
     session.verified_response_bytes = len(raw_audio)
     session.verified_response_frames += 1
     session.transcript_tokens.append(response_text)
+    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    verified_start_ms = _call_relative_ms(session)
+    verified_end_ms = verified_start_ms + duration_ms
     if session.conversation_logger:
         await session.conversation_logger.add_turn(
             "ai",
             response_text,
             source_used="verified_response",
             quality_label=f"reason={reason}",
+            start_ms=verified_start_ms,
+            end_ms=verified_end_ms,
         )
-    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
 
     peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
     if not session.first_playback_logged:
@@ -539,6 +564,98 @@ async def _send_verified_response(ws_fs, session: CallSession, reason: str):
         _maybe_log_audio_stats(session)
     except (ConnectionError, asyncio.CancelledError):
         log.warning("Call %s: Failed sending verified AI response to FreeSWITCH", session.call_uuid, exc_info=True)
+
+
+def _classify_off_topic(text: str) -> bool:
+    """Simple rule-based off-topic check against the appointment domain.
+
+    Returns True when none of the appointment-domain keywords appear in
+    the caller's text (case-insensitive substring match).
+    """
+    lowered = (text or "").lower()
+    return not any(keyword in lowered for keyword in APPOINTMENT_KEYWORDS)
+
+
+async def _send_off_topic_redirect(ws_fs, session: CallSession, reason: str):
+    """Send a deterministic, TTS-synthesized redirect when the caller drifts
+    off the appointment-booking domain. Reuses the same flite/ffmpeg
+    synthesis path as the verified AI response so the caller reliably hears
+    the redirect regardless of what PersonaPlex is doing at that moment.
+    """
+    if not OFF_TOPIC_REDIRECT_ENABLED or ws_fs.closed or not session.active:
+        return
+
+    now = time.monotonic()
+    if now - session.last_off_topic_redirect_ts < OFF_TOPIC_REDIRECT_COOLDOWN_S:
+        log.info(
+            "Call %s: off-topic redirect suppressed (cooldown) reason=%s",
+            session.call_uuid,
+            reason,
+        )
+        return
+    session.last_off_topic_redirect_ts = now
+
+    response_text = OFF_TOPIC_REDIRECT_TEXT
+    try:
+        raw_audio = await asyncio.to_thread(_build_verified_response_raw, response_text)
+    except Exception:
+        log.exception("Call %s: off-topic redirect synthesis failed", session.call_uuid)
+        return
+
+    if not session.active or ws_fs.closed:
+        log.info(
+            "Call %s: skipping off-topic redirect; active=%s ws_closed=%s",
+            session.call_uuid,
+            session.active,
+            ws_fs.closed,
+        )
+        return
+
+    pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+    session.ai_pcm_chunks.append(raw_audio)
+    session.ai_probe.add_pcm_float(pcm, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
+    session.playback_frames += 1
+    session.playback_bytes += len(raw_audio)
+    session.off_topic_redirect_count += 1
+    session.transcript_tokens.append(response_text)
+
+    off_topic_duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    off_topic_start_ms = _call_relative_ms(session)
+    off_topic_end_ms = off_topic_start_ms + off_topic_duration_ms
+
+    if session.conversation_logger:
+        await session.conversation_logger.add_turn(
+            "ai",
+            response_text,
+            source_used="off_topic_redirect",
+            quality_label=f"reason={reason}",
+            start_ms=off_topic_start_ms,
+            end_ms=off_topic_end_ms,
+        )
+        await session.conversation_logger.add_reasoning(
+            step="off_topic_redirect_sent",
+            source="verified_response_tts",
+            decision="redirect_sent",
+            reason=reason,
+            metadata={"text": response_text, "redirect_count": session.off_topic_redirect_count},
+        )
+
+    duration_ms = (len(raw_audio) / 2) * 1000.0 / FS_PLAYBACK_SAMPLE_RATE
+    peak = int(np.max(np.abs(pcm)) * 32767) if pcm.size else 0
+    log.info(
+        "Call %s: OFF_TOPIC_REDIRECT sent reason=%s text=%r bytes=%d duration_ms=%.0f peak=%d",
+        session.call_uuid,
+        reason,
+        response_text,
+        len(raw_audio),
+        duration_ms,
+        peak,
+    )
+    try:
+        await _send_stream_audio(ws_fs, session, raw_audio)
+        _maybe_log_audio_stats(session)
+    except (ConnectionError, asyncio.CancelledError):
+        log.warning("Call %s: Failed sending off-topic redirect to FreeSWITCH", session.call_uuid, exc_info=True)
 
 
 async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
@@ -641,9 +758,6 @@ def _decode_l16_audio(data: bytes, sample_rate: int, session: CallSession):
     if pcm.size:
         session.fs_audio_peak = max(session.fs_audio_peak, int(np.max(np.abs(pcm)) * 32767))
         session.caller_probe.add_pcm_float(pcm, sample_rate, len(data))
-        caller_l16 = _pcm_float_to_l16_bytes(_resample_linear(pcm, sample_rate, FS_SAMPLE_RATE))
-        if caller_l16:
-            session.caller_pcm_chunks.append(caller_l16)
     return pcm, sample_rate
 
 
@@ -683,6 +797,13 @@ def _resample_linear(pcm, from_rate: int, to_rate: int):
     n_out = max(1, int(len(pcm) * to_rate / from_rate))
     indices = np.linspace(0, len(pcm) - 1, n_out)
     return np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
+
+
+def _call_relative_ms(session: "CallSession") -> int:
+    """Milliseconds since session.started_at - keeps conversation-turn
+    timestamps comparable across caller/agent sources and against the
+    recorded call WAV, rather than using wall-clock epoch time."""
+    return int((time.time() - session.started_at) * 1000)
 
 
 def _pcm_float_to_l16_bytes(pcm) -> bytes:
@@ -1031,18 +1152,46 @@ async def _handle_audio_ws(request):
         if session.conversation_logger:
             session.conversation_logger.start()
         if STT_ENABLED and session.conversation_logger:
-            async def on_final_caller_text(text, confidence=None):
+            async def on_final_caller_text(text, start_ms, end_ms, quality=None):
+                is_off_topic = _classify_off_topic(text)
+                intent = "off_topic" if is_off_topic else "appointment_booking"
+
+                await session.conversation_logger.add_reasoning(
+                    step="checking_transcript",
+                    source="faster_whisper_local",
+                    reason="final caller STT received",
+                    metadata={"text": text, "start_ms": start_ms, "end_ms": end_ms, "avg_logprob": quality},
+                )
+                await session.conversation_logger.add_reasoning(
+                    step="intent_check",
+                    source="caller_transcript",
+                    decision=intent,
+                    reason=(
+                        "caller text did not match appointment domain"
+                        if is_off_topic
+                        else "caller text matched appointment domain"
+                    ),
+                    metadata={"text": text, "start_ms": start_ms, "end_ms": end_ms, "avg_logprob": quality},
+                )
                 await session.conversation_logger.add_turn(
                     "caller",
                     text,
-                    source_used="deepgram_realtime",
-                    quality_label=f"confidence={confidence:.3f}" if confidence is not None else None,
+                    intent=intent,
+                    is_off_topic=is_off_topic,
+                    source_used="faster_whisper_local",
+                    quality_label=f"avg_logprob={quality:.3f}" if quality is not None else None,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
                 )
+
+                if is_off_topic:
+                    await _send_off_topic_redirect(ws_fs, session, "caller_off_topic")
 
             stt_session = stt.StreamingSTTSession(
                 call_uuid=session.call_uuid,
                 sample_rate=FS_SAMPLE_RATE,
                 on_final_text=on_final_caller_text,
+                timeline_offset_ms=_call_relative_ms(session),
             )
             if stt_session.start():
                 session.stt_session = stt_session
@@ -1515,7 +1664,7 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                         # Convert to L16 (16-bit signed LE) for mod_audio_stream streamAudio.
                         l16 = (np.clip(pcm_fs, -1.0, 1.0) * 32767).astype(np.int16)
                         raw_audio = l16.tobytes()
-                        session.ai_pcm_chunks.append(raw_audio)
+                        #session.ai_pcm_chunks.append(raw_audio)
                         session.ai_probe.add_pcm_float(pcm_fs, FS_PLAYBACK_SAMPLE_RATE, len(raw_audio))
                         session.moshi_audio_frames += 1
                         session.playback_frames += 1
@@ -1538,6 +1687,10 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                             break
                 elif kind == 2:  # Agent text token
                     text = payload.decode("utf-8", "replace")
+
+                    if not session.ai_turn_buffer:
+                        # First token of a new agent sentence.
+                        session.agent_turn_start_ms = _call_relative_ms(session)
 
                     session.transcript_tokens.append(text)
                     session.ai_turn_buffer.append(text)
@@ -1646,12 +1799,6 @@ async def _finalize_call(session: CallSession):
     session.finalized = True
     caller_path = ""
     ai_path = ""
-    if session.caller_pcm_chunks:
-        caller_path = FS_TEMP_DIR.rstrip("/") + "/personaplex_caller_direct_" + session.call_uuid + ".wav"
-        _save_pcm_wav(session, caller_path, session.caller_pcm_chunks, FS_SAMPLE_RATE, "caller")
-    if session.ai_pcm_chunks:
-        ai_path = FS_TEMP_DIR.rstrip("/") + "/personaplex_ai_direct_" + session.call_uuid + ".wav"
-        _save_pcm_wav(session, ai_path, session.ai_pcm_chunks, FS_PLAYBACK_SAMPLE_RATE, "AI")
     transcript = "".join(session.transcript_tokens).strip()
     _log_audio_proof(session, caller_path, ai_path, transcript)
     if session.stt_session:
@@ -1808,9 +1955,27 @@ async def _flush_ai_turn(session: CallSession, reason: str):
 
     session.ai_turn_buffer.clear()
 
+    agent_turn_end_ms = _call_relative_ms(session)
+    agent_turn_start_ms = session.agent_turn_start_ms
+    if agent_turn_start_ms is None:
+        # Shouldn't normally happen (a token had to arrive to fill the
+        # buffer), but fall back to a zero-length span rather than emitting
+        # a turn with no start_ms at all.
+        agent_turn_start_ms = agent_turn_end_ms
+    session.agent_turn_start_ms = None
+
     await session.conversation_logger.add_turn(
         "ai",
         text,
         source_used="personaplex",
         quality_label=f"flush_reason={reason}",
+        start_ms=agent_turn_start_ms,
+        end_ms=agent_turn_end_ms,
+    )
+    await session.conversation_logger.add_reasoning(
+        step="answer_generated",
+        source="personaplex",
+        decision="ai_response",
+        reason="PersonaPlex generated text token response",
+        metadata={"flush_reason": reason, "start_ms": agent_turn_start_ms, "end_ms": agent_turn_end_ms},
     )
