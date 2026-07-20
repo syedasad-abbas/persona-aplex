@@ -75,6 +75,10 @@ services:
       - FS_PLAYBACK_BROADCAST_BATCH_MS=480
       - FS_PLAYBACK_BROADCAST_MAX_DELAY_MS=8000
       - FS_PLAYBACK_BROADCAST_DELAY=0.10
+      - STT_ENABLED=1
+      - STT_PROVIDER=faster_whisper
+      - WHISPER_MODEL=base.en
+      - STT_LANGUAGE=en
     ulimits:
       nofile:
         soft: 65536

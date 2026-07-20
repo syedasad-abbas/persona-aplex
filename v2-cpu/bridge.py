@@ -31,6 +31,10 @@ import wave
 import stt
 from typing import Optional, List
 from conversation_logger import ConversationLogger
+from datetime import datetime, date
+import secrets
+import dateparser
+import phonenumbers
 
 import numpy as np
 import sphn
@@ -243,6 +247,22 @@ class CallSession:
         # ms from session.started_at when the current agent sentence's first
         # text token arrived; None when no agent turn is in progress.
         self.agent_turn_start_ms = None
+        self.booking_data = {
+        "caller_name": None,
+        "caller_phone": None,
+        "preferred_date": None,
+        "preferred_time": None,
+        "reason": None,
+        "slot_label": None,
+    }
+
+        self.booking_expected_field = None
+        self.booking_awaiting_confirmation = False
+        self.booking_completed = False
+        self.booking_id = None
+        self.booking_reference = None
+        self.booking_lock = asyncio.Lock()
+        self.booking_message_active = False
 
     @property
     def active(self):
@@ -258,6 +278,126 @@ _sessions_lock = threading.Lock()
 _moshi_session_lock: Optional[asyncio.Lock] = None
 _relay_loop: Optional[asyncio.AbstractEventLoop] = None
 
+def _observe_booking_question(session: CallSession, ai_text: str):
+    text = (ai_text or "").lower()
+
+    if "may i have your full name" in text:
+        session.booking_expected_field = "caller_name"
+    elif "callback phone number" in text:
+        session.booking_expected_field = "caller_phone"
+    elif "what date would you prefer" in text:
+        session.booking_expected_field = "preferred_date"
+    elif "what time would you prefer" in text:
+        session.booking_expected_field = "preferred_time"
+    elif "reason for your appointment" in text:
+        session.booking_expected_field = "reason"
+    elif "should i confirm this appointment" in text:
+        session.booking_expected_field = "confirmation"
+        session.booking_awaiting_confirmation = True
+def _parse_phone(text: str):
+    try:
+        number = phonenumbers.parse(text, "US")
+        if not phonenumbers.is_valid_number(number):
+            return None
+        return phonenumbers.format_number(
+            number,
+            phonenumbers.PhoneNumberFormat.E164,
+        )
+    except phonenumbers.NumberParseException:
+        return None
+
+
+def _parse_future_date(text: str):
+    parsed = dateparser.parse(
+        text,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "DATE_ORDER": "MDY",
+            "RETURN_AS_TIMEZONE_AWARE": False,
+        },
+    )
+    if not parsed or parsed.date() < date.today():
+        return None
+    return parsed.date().isoformat()
+
+
+def _parse_time(text: str):
+    parsed = dateparser.parse(
+        text,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "RETURN_AS_TIMEZONE_AWARE": False,
+        },
+    )
+    if not parsed:
+        return None
+    return parsed.strftime("%H:%M:00")
+
+
+def _is_yes(text: str):
+    normalized = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    return normalized in {
+        "yes",
+        "yes please",
+        "correct",
+        "confirm",
+        "confirmed",
+        "that is correct",
+        "go ahead",
+    }
+
+
+def _is_no(text: str):
+    normalized = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    return normalized in {
+        "no",
+        "no thanks",
+        "incorrect",
+        "do not confirm",
+        "dont confirm",
+        "change it",
+    }
+
+def _collect_booking_answer(session: CallSession, text: str):
+    field = session.booking_expected_field
+    value = None
+    error = None
+
+    if field == "caller_name":
+        value = re.sub(
+            r"^(my name is|this is|i am|i'm)\s+",
+            "",
+            text.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        if len(value) < 2:
+            error = "I did not understand the name. Please repeat your full name."
+
+    elif field == "caller_phone":
+        value = _parse_phone(text)
+        if not value:
+            error = "I did not understand the phone number. Please repeat it including the area code."
+
+    elif field == "preferred_date":
+        value = _parse_future_date(text)
+        if not value:
+            error = "I did not understand the date. Please say a future date."
+
+    elif field == "preferred_time":
+        value = _parse_time(text)
+        if not value:
+            error = "I did not understand the time. Please repeat the preferred time."
+
+    elif field == "reason":
+        value = text.strip()
+        if len(value) < 3:
+            error = "Please briefly repeat the reason for the appointment."
+
+    if value:
+        session.booking_data[field] = value
+        session.booking_expected_field = None
+
+    return field, value, error
 
 def _get_moshi_session_lock() -> asyncio.Lock:
     """PersonaPlex moshi.server serializes sessions; do not queue sockets forever."""
@@ -657,6 +797,45 @@ async def _send_off_topic_redirect(ws_fs, session: CallSession, reason: str):
     except (ConnectionError, asyncio.CancelledError):
         log.warning("Call %s: Failed sending off-topic redirect to FreeSWITCH", session.call_uuid, exc_info=True)
 
+async def _send_booking_message(ws_fs, session: CallSession, text: str):
+    if ws_fs.closed or not session.active:
+        return
+
+    session.booking_message_active = True
+
+    try:
+        raw_audio = await asyncio.to_thread(
+            _build_verified_response_raw,
+            text,
+        )
+
+        pcm = (
+            np.frombuffer(raw_audio, dtype=np.int16)
+            .astype(np.float32)
+            / 32768.0
+        )
+
+        session.ai_probe.add_pcm_float(
+            pcm,
+            FS_PLAYBACK_SAMPLE_RATE,
+            len(raw_audio),
+        )
+        session.playback_frames += 1
+        session.playback_bytes += len(raw_audio)
+        session.transcript_tokens.append(text)
+
+        await _send_stream_audio(ws_fs, session, raw_audio)
+
+        if session.conversation_logger:
+            await session.conversation_logger.add_turn(
+                "ai",
+                text,
+                source_used="booking_controller",
+                quality_label="deterministic_booking_result",
+                start_ms=_call_relative_ms(session),
+            )
+    finally:
+        session.booking_message_active = False
 
 async def _run_verified_response_only(ws_fs, session: CallSession, reason: str):
     log.info(
@@ -1184,6 +1363,112 @@ async def _handle_audio_ws(request):
                     end_ms=end_ms,
                 )
 
+                async with session.booking_lock:
+                    expected = session.booking_expected_field
+
+                    if expected == "confirmation":
+                        if _is_yes(text):
+                            missing = [
+                                field
+                                for field in (
+                                    "caller_name",
+                                    "caller_phone",
+                                    "preferred_date",
+                                    "preferred_time",
+                                    "reason",
+                                )
+                                if not session.booking_data.get(field)
+                            ]
+
+                            if missing:
+                                await _send_booking_message(
+                                    ws_fs,
+                                    session,
+                                    "I cannot confirm the appointment because some details are missing.",
+                                )
+                                return
+
+                            reference = secrets.token_hex(4).upper()
+
+                            try:
+                                result = await asyncio.to_thread(
+                                    db.save_appointment,
+                                    session.call_id,
+                                    session.booking_data,
+                                    reference,
+                                )
+                            except db.AppointmentSlotUnavailable:
+                                session.booking_awaiting_confirmation = False
+                                session.booking_expected_field = "preferred_time"
+
+                                await _send_booking_message(
+                                    ws_fs,
+                                    session,
+                                    "That appointment time is no longer available. "
+                                    "Please choose another time.",
+                                )
+                                return
+                            except Exception:
+                                log.exception(
+                                    "Call %s: appointment booking failed",
+                                    session.call_uuid,
+                                )
+                                await _send_booking_message(
+                                    ws_fs,
+                                    session,
+                                    "I could not complete the appointment. "
+                                    "Your appointment has not been booked.",
+                                )
+                                return
+
+                            session.booking_id = result["id"]
+                            session.booking_reference = result["booking_reference"]
+                            session.booking_completed = True
+
+                            await _send_booking_message(
+                                ws_fs,
+                                session,
+                                "Your appointment is confirmed for "
+                                f"{session.booking_data['preferred_date']} at "
+                                f"{session.booking_data['preferred_time']}. "
+                                f"Your confirmation number is "
+                                f"{session.booking_reference}.",
+                            )
+                            return
+
+                        if _is_no(text):
+                            session.booking_awaiting_confirmation = False
+                            session.booking_expected_field = None
+                            await _send_booking_message(
+                                ws_fs,
+                                session,
+                                "The appointment was not booked. "
+                                "Please tell me which detail you would like to change.",
+                            )
+                            return
+
+                        await _send_booking_message(
+                            ws_fs,
+                            session,
+                            "Please say yes to confirm or no to make a change.",
+                        )
+                        return
+
+                    field, value, error = _collect_booking_answer(session, text)
+
+                    if error:
+                        await _send_booking_message(ws_fs, session, error)
+                        return
+
+                    if field and value and session.call_id:
+                        await asyncio.to_thread(
+                            db.save_collected_data,
+                            session.call_id,
+                            field,
+                            str(value),
+                            False,
+                        )
+
                 if is_off_topic:
                     await _send_off_topic_redirect(ws_fs, session, "caller_off_topic")
 
@@ -1637,6 +1922,8 @@ async def _relay_moshi_to_fs(ws_moshi, ws_fs, session: CallSession):
                     continue
                 kind = msg.data[0]
                 payload = msg.data[1:]
+                if session.booking_message_active or session.booking_completed:
+                    continue
 
                 if session.verified_response_sent and VERIFIED_AI_RESPONSE_SUPPRESS_MOSHI_AFTER:
                     if kind == 1:
@@ -1952,6 +2239,8 @@ async def _flush_ai_turn(session: CallSession, reason: str):
     text = "".join(session.ai_turn_buffer).strip()
     if not text:
         return
+
+    _observe_booking_question(session, text)
 
     session.ai_turn_buffer.clear()
 

@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS agent_collected_data (
 CREATE TABLE IF NOT EXISTS appointment_bookings (
     id                BIGINT AUTO_INCREMENT PRIMARY KEY,
     call_id           BIGINT NOT NULL,
+    booking_reference VARCHAR(20) NOT NULL,
     caller_name       VARCHAR(255),
     caller_phone      VARCHAR(50),
     appointment_date  DATE,
@@ -96,7 +97,17 @@ CREATE TABLE IF NOT EXISTS appointment_bookings (
     status            ENUM('pending','confirmed','cancelled') NOT NULL DEFAULT 'pending',
     created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    -- Performance Indexes
     INDEX idx_date (appointment_date),
     INDEX idx_status (status),
+    
+    -- Idempotency Constraints (Prevent duplicates & double bookings)
+    UNIQUE KEY uk_booking_call (call_id),
+    UNIQUE KEY uk_booking_slot (appointment_date, appointment_time),
+    UNIQUE KEY uk_booking_reference (booking_reference),
+    
+    -- Foreign Key Relationship
     FOREIGN KEY (call_id) REFERENCES agent_calls(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+

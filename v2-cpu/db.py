@@ -19,6 +19,8 @@ DB_PASS = os.getenv("DB_PASS", "")
 
 _schema_lock = threading.Lock()
 _conversation_schema_ready = False
+_appointment_schema_lock = threading.Lock()
+_appointment_schema_ready = False
 
 _CONVERSATION_REVIEW_COLUMNS = {
     "start_ms": "BIGINT NULL",
@@ -40,6 +42,12 @@ _CONVERSATION_REVIEW_INDEXES = {
     "idx_review_label": "ADD INDEX idx_review_label (review_label)",
     "idx_memory_scope": "ADD INDEX idx_memory_scope (memory_scope)",
     "idx_live_memory": "ADD INDEX idx_live_memory (use_in_live_context, memory_scope)",
+}
+
+_APPOINTMENT_BOOKING_INDEXES = {
+    "uk_booking_call": "ADD UNIQUE INDEX uk_booking_call (call_id)",
+    "uk_booking_slot": "ADD UNIQUE INDEX uk_booking_slot (appointment_date, appointment_time)",
+    "uk_booking_reference": "ADD UNIQUE INDEX uk_booking_reference (booking_reference)",
 }
 
 
@@ -156,6 +164,62 @@ def ensure_conversation_review_schema(conn=None):
                 conn.close()
 
 
+def ensure_appointment_booking_schema(conn=None):
+    """Upgrade appointment_bookings for existing database volumes."""
+    global _appointment_schema_ready
+    if _appointment_schema_ready:
+        return
+
+    owns_conn = conn is None
+    with _appointment_schema_lock:
+        if _appointment_schema_ready:
+            return
+        conn = conn or get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='appointment_bookings'
+                    """,
+                    (DB_NAME,),
+                )
+                existing_columns = {row["COLUMN_NAME"] for row in cur.fetchall()}
+                if "booking_reference" not in existing_columns:
+                    cur.execute(
+                        "ALTER TABLE appointment_bookings "
+                        "ADD COLUMN booking_reference VARCHAR(20) NULL AFTER call_id"
+                    )
+
+                cur.execute(
+                    "UPDATE appointment_bookings "
+                    "SET booking_reference=CONCAT('LEGACY-', id) "
+                    "WHERE booking_reference IS NULL OR booking_reference=''"
+                )
+                cur.execute(
+                    "ALTER TABLE appointment_bookings "
+                    "MODIFY booking_reference VARCHAR(20) NOT NULL"
+                )
+
+                cur.execute(
+                    """
+                    SELECT INDEX_NAME
+                    FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='appointment_bookings'
+                    """,
+                    (DB_NAME,),
+                )
+                existing_indexes = {row["INDEX_NAME"] for row in cur.fetchall()}
+                for index_name, definition in _APPOINTMENT_BOOKING_INDEXES.items():
+                    if index_name not in existing_indexes:
+                        cur.execute(f"ALTER TABLE appointment_bookings {definition}")
+            _appointment_schema_ready = True
+        finally:
+            if owns_conn:
+                conn.close()
+
+
 def create_call(call_uuid, caller_number, called_number, domain, voice_prompt, text_prompt):
     conn = get_conn()
     try:
@@ -163,6 +227,7 @@ def create_call(call_uuid, caller_number, called_number, domain, voice_prompt, t
             ensure_conversation_review_schema(conn)
         except Exception:
             log.warning("Conversation review schema check failed", exc_info=True)
+        ensure_appointment_booking_schema(conn)
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO agent_calls "
@@ -202,26 +267,92 @@ def save_collected_data(call_id, field_name, field_value, confirmed=False):
         conn.close()
 
 
-def save_appointment(call_id, data):
-    conn = get_conn()
+class AppointmentSlotUnavailable(Exception):
+    pass
+
+
+def save_appointment(call_id, data, booking_reference):
+    conn = get_conn(autocommit=False)
+
     try:
         with conn.cursor() as cur:
+            # If this confirmation was processed twice, return the first booking.
             cur.execute(
-                "INSERT INTO appointment_bookings "
-                "(call_id, caller_name, caller_phone, appointment_date, "
-                " appointment_time, slot_label, reason, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed')",
-                (
-                    call_id,
-                    data.get("caller_name"),
-                    data.get("caller_phone"),
-                    data.get("preferred_date"),
-                    data.get("preferred_time"),
-                    data.get("slot_label"),
-                    data.get("reason"),
-                ),
+                """
+                SELECT id, booking_reference
+                FROM appointment_bookings
+                WHERE call_id=%s
+                FOR UPDATE
+                """,
+                (call_id,),
             )
-            return cur.lastrowid
+            existing = cur.fetchone()
+
+            if existing:
+                conn.commit()
+                return existing
+
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO appointment_bookings (
+                        call_id,
+                        caller_name,
+                        caller_phone,
+                        appointment_date,
+                        appointment_time,
+                        slot_label,
+                        reason,
+                        booking_reference,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
+                    """,
+                    (
+                        call_id,
+                        data["caller_name"],
+                        data["caller_phone"],
+                        data["preferred_date"],
+                        data["preferred_time"],
+                        data.get("slot_label"),
+                        data.get("reason"),
+                        booking_reference,
+                    ),
+                )
+            except pymysql.err.IntegrityError as exc:
+                if exc.args and exc.args[0] == 1062:
+                    raise AppointmentSlotUnavailable(
+                        "The requested appointment slot is unavailable"
+                    ) from exc
+                raise
+
+            booking_id = cur.lastrowid
+
+            for field_name, field_value in data.items():
+                if field_value:
+                    cur.execute(
+                        """
+                        INSERT INTO agent_collected_data
+                            (call_id, field_name, field_value, confirmed)
+                        VALUES (%s, %s, %s, TRUE)
+                        ON DUPLICATE KEY UPDATE
+                            field_value=VALUES(field_value),
+                            confirmed=TRUE,
+                            updated_at=NOW()
+                        """,
+                        (call_id, field_name, str(field_value)),
+                    )
+
+        conn.commit()
+
+        return {
+            "id": booking_id,
+            "booking_reference": booking_reference,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
